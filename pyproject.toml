@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causalia-article-extractor"
+version = "2.0.0"
+description = "Evidence-anchored article extraction from Browsertrix WACZ archives"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# The dependency set is deliberately identical to the one the first-generation
+# extractor already runs in production. Nothing new is introduced: lxml alone
+# covers XPath generation and evaluation, and the project has previously
+# rejected both pydantic (plain dataclasses with explicit to_dict) and
+# trafilatura (paying for two article extractors on every article).
+dependencies = [
+    "warcio>=1.7",          # streaming WARC record parsing
+    "beautifulsoup4>=4.12",  # tolerant parsing of the captured markup
+    "lxml>=5.0",             # parser backend, plus XPath generate/evaluate
+    "readability-lxml>=0.8",  # Mozilla Readability, Python port
+    "Pillow>=10.0",          # image dimensions ONLY - headers parsed, pixels never decoded
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+# Database tooling only. Deliberately NOT a runtime dependency of
+# causalia_extractor: the extractor opens no socket and no database connection,
+# and there is a test asserting it. Used by scripts/ (migrations, ingestion
+# validation), which is not part of the package.
+db = ["psycopg2-binary>=2.9"]
+
+[project.scripts]
+causalia-extractor = "causalia_extractor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-q --tb=short"
