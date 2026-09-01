@@ -33,23 +33,9 @@ done
 PSQL=(docker exec -i "$CONTAINER" psql -U causalia -d causalia -v ON_ERROR_STOP=1 -q)
 
 echo "== crawler stand-in tables"
-"${PSQL[@]}" <<'SQL'
-CREATE TABLE urls (
-    url_hash TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, outlet TEXT NOT NULL,
-    lastmod TIMESTAMPTZ, sitemap_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    collected_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE archives (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    url_hash TEXT NOT NULL REFERENCES urls(url_hash) ON DELETE CASCADE,
-    outlet TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'in_progress'
-           CHECK (status IN ('in_progress','success','failed')),
-    wacz_path TEXT, wacz_sha256 TEXT, wacz_size_bytes BIGINT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE videos (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
-CREATE TABLE schema_migrations (version TEXT PRIMARY KEY,
-                                applied_at TIMESTAMPTZ DEFAULT now());
-SQL
+# One copy, shared with scripts/devdb.sh, so the stand-in cannot drift
+# between the throwaway harness and the development database.
+"${PSQL[@]}" < "$REPO/scripts/standin_crawler.sql"
 
 echo "== migrations"
 for f in "$REPO"/migrations/[0-9]*.sql; do
