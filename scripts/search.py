@@ -8,8 +8,10 @@ us before adding anything.
 No DDL. Every function here is a query over columns migrations 001-007 already
 created, so the approved schema stays frozen:
 
-    article.search_tsv        title(A) subtitle(B) description(B) authors(C) tags(C)
-    content_block.text_tsv    the block's own text
+    article.search_tsv          title(A) subtitle(B) description(B) authors(C) tags(C)
+    content_block.text_tsv      the block's own text
+    article_image.caption_tsv   caption + alt + credit (008; discoverable, and
+                                deliberately NOT citable - it carries no selector)
 
 There is deliberately no third whole-body vector: an article matches on its body
 through a semi-join over its blocks (docs/postgres-schema.md D.2). The cost of
@@ -87,11 +89,17 @@ def _blocks_for(cur, article_id: int, query: str, limit: int) -> list[dict]:
 
 def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = None,
                     tag: str | None = None, blocks_per_article: int = 3) -> list[dict]:
-    """Search article metadata AND article prose.
+    """Search article metadata, article prose AND image captions.
 
     Returns enough for a UI or an agent to act without a second round trip:
     identity, the display fields, WHY it matched, and - when the match is in the
     prose - the matching blocks with the selector needed to cite them.
+
+    A caption match sets `caption_match` and contributes to the score, but
+    yields no blocks: caption text has no selector, so it can be surfaced and
+    ranked but not cited. `match_reason` says `caption` when that is the ONLY
+    reason the article came back, so a caller can tell "found the evidence" from
+    "found the article" without inspecting the ranks.
     """
     cur.execute(f"""
         WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
@@ -104,7 +112,12 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                   FROM corpus.content_block b
                  WHERE b.article_id = a.id
                    AND b.extraction_id = a.current_extraction_id
-                   AND b.text_tsv @@ q.tsq)                AS body_rank
+                   AND b.text_tsv @@ q.tsq)                AS body_rank,
+               (SELECT max(ts_rank(i.caption_tsv, q.tsq))
+                  FROM corpus.article_image i
+                 WHERE i.article_id = a.id
+                   AND i.extraction_id = a.current_extraction_id
+                   AND i.caption_tsv @@ q.tsq)             AS caption_rank
         FROM corpus.article a
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
@@ -112,7 +125,11 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                OR EXISTS (SELECT 1 FROM corpus.content_block b
                            WHERE b.article_id = a.id
                              AND b.extraction_id = a.current_extraction_id
-                             AND b.text_tsv @@ q.tsq))
+                             AND b.text_tsv @@ q.tsq)
+               OR EXISTS (SELECT 1 FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ q.tsq))
           AND (%(outlet)s IS NULL OR a.outlet = %(outlet)s)
           AND (%(tag)s   IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
         ORDER BY (ts_rank(a.search_tsv, q.tsq)
@@ -120,7 +137,12 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                                 FROM corpus.content_block b
                                WHERE b.article_id = a.id
                                  AND b.extraction_id = a.current_extraction_id
-                                 AND b.text_tsv @@ q.tsq), 0)) DESC,
+                                 AND b.text_tsv @@ q.tsq), 0)
+                  + coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
+                                FROM corpus.article_image i
+                               WHERE i.article_id = a.id
+                                 AND i.extraction_id = a.current_extraction_id
+                                 AND i.caption_tsv @@ q.tsq), 0)) DESC,
                  a.published_at DESC NULLS LAST
         LIMIT %(limit)s
     """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit})
@@ -130,9 +152,14 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
         hit = dict(row)
         hit["body_rank"] = float(hit["body_rank"] or 0.0)
         hit["meta_rank"] = float(hit["meta_rank"] or 0.0)
-        hit["score"] = hit["meta_rank"] + hit["body_rank"]
-        hit["match_reason"] = ("both" if hit["meta_match"] and hit["body_rank"]
-                              else "metadata" if hit["meta_match"] else "body")
+        hit["caption_rank"] = float(hit["caption_rank"] or 0.0)
+        hit["caption_match"] = hit["caption_rank"] > 0
+        hit["score"] = hit["meta_rank"] + hit["body_rank"] + hit["caption_rank"]
+        hit["match_reason"] = (
+            "both" if hit["meta_match"] and hit["body_rank"]
+            else "metadata" if hit["meta_match"]
+            else "body" if hit["body_rank"]
+            else "caption")
         hit["blocks"] = (_blocks_for(cur, hit["id"], query, blocks_per_article)
                          if hit["body_rank"] else [])
         results.append(hit)

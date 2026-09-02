@@ -584,7 +584,7 @@ past the planner, and it must not be widened to `anyarray`. The two-argument
 only STABLE and cannot be used in a generated column at all, which is why the
 config is spelled out everywhere.
 
-### D.2 Two vectors, and why not three
+### D.2 Three vectors, and why not four
 
 **`article.search_tsv`** — for *finding articles*:
 
@@ -605,7 +605,31 @@ author and tag search for free, which is why there is no separate author index.
 corpus.search_vector(coalesce(text,''))
 ```
 
-**There is deliberately no third vector over the whole article body.**
+**`article_image.caption_tsv`** — for *finding pictures by what they show*
+(migration 008):
+
+```sql
+corpus.search_vector(coalesce(caption,'') || ' ' || coalesce(alt,'')
+                                          || ' ' || coalesce(credit,''))
+```
+
+`block_text` is NULL for image and video blocks by design — an image block
+points at a row, it does not carry prose — so before 008 those blocks held an
+empty vector and 15% of all blocks could never match anything, with every image
+caption invisible to search. Caption text could not join `article.search_tsv`
+because a `STORED` generated column may only reference its own row, and it must
+not join `block_text` because the citation chain rests on
+`block_text = normalize_text(element)` and a caption lives in a `<figcaption>`
+that is not the block's element. So it gets its own vector, reached by the same
+semi-join as the body.
+
+It is **discoverable but not citable**: there is no selector for a caption, so a
+caption match tells you which article and which image and stops there. Measured
+over 277 query variants, that is 80 hits that now come back and cannot be
+pointed at — a deliberate trade, and the reason `search_articles` reports
+`match_reason = 'caption'` so a caller can tell the two apart.
+
+**There is deliberately no fourth vector over the whole article body.**
 `search_articles(query)` matching body text is served by a semi-join:
 
 ```sql

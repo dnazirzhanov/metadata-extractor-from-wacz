@@ -11,6 +11,7 @@ Plain, idempotent SQL. Design and rationale: [../docs/postgres-schema.md](../doc
 | `005_passage_reference.sql` | `passage_reference`, `corpus.passage_selector` view |
 | `006_indexes.sql` | 24 indexes — 15 query, 9 FK-maintenance |
 | `007_search_recall.sql` | `hungarian_lemma` + `hungarian_surface` configs, `unaccent_immutable`, `search_vector`, `search_query`; rebuilds both search vectors |
+| `008_caption_search.sql` | `article_image.caption_tsv` — image captions, alt text and credits become searchable (discoverable, not citable) |
 
 ## What these do and do not touch
 

@@ -96,11 +96,16 @@ def load_corpus(cur) -> dict[int, dict]:
                concat_ws(' ', a.title, a.subtitle, a.description,
                          corpus.text_array_to_string(a.authors),
                          corpus.text_array_to_string(a.tags),
-                         string_agg(b.block_text, ' ')) AS full_text
+                         string_agg(DISTINCT b.block_text, ' '),
+                         string_agg(DISTINCT concat_ws(' ', i.caption, i.alt,
+                                                       i.credit), ' ')) AS full_text
           FROM corpus.article a
           LEFT JOIN corpus.content_block b
                  ON b.article_id = a.id
                 AND b.extraction_id = a.current_extraction_id
+          LEFT JOIN corpus.article_image i
+                 ON i.article_id = a.id
+                AND i.extraction_id = a.current_extraction_id
          GROUP BY a.id
     """)
     return {r["id"]: {"outlet": r["outlet"], "title": r["title"],
@@ -233,7 +238,20 @@ class Citations:
         """, (article_id, query, query))
         blocks = self.cur.fetchall()
         if not blocks:
-            return {"ok": False, "reason": "metadata_only_no_block"}
+            # Distinguish the two ways an article can match with nothing to
+            # cite. Since 008 a caption match is a real, useful hit that simply
+            # has no selector; lumping it in with a title/tag match would hide
+            # which of the two gaps is growing.
+            self.cur.execute("""
+                SELECT EXISTS (SELECT 1 FROM corpus.article_image i
+                                JOIN corpus.article a ON a.id = i.article_id
+                                WHERE i.article_id = %s
+                                  AND i.extraction_id = a.current_extraction_id
+                                  AND i.caption_tsv @@ corpus.search_query(%s))
+            """, (article_id, query))
+            return {"ok": False,
+                    "reason": ("caption_only_no_block" if self.cur.fetchone()[0]
+                               else "metadata_only_no_block")}
 
         tree = self.tree_for(article_id)
         if tree is None:
@@ -330,6 +348,10 @@ def main(argv: list[str]) -> int:
                             WHERE b.article_id = a.id
                               AND b.extraction_id = a.current_extraction_id
                               AND b.text_tsv @@ corpus.search_query(%(q)s))
+                OR EXISTS (SELECT 1 FROM corpus.article_image i
+                            WHERE i.article_id = a.id
+                              AND i.extraction_id = a.current_extraction_id
+                              AND i.caption_tsv @@ corpus.search_query(%(q)s))
         """, {"q": q})
         got = {r[0] for r in cur.fetchall()}
         hit = got & want
@@ -362,7 +384,8 @@ def main(argv: list[str]) -> int:
             if outcome["ok"]:
                 bucket["cited"] += 1
                 by_block_type[outcome["block_type"]] += 1
-            elif outcome["reason"] == "metadata_only_no_block":
+            elif outcome["reason"] in ("metadata_only_no_block",
+                                       "caption_only_no_block"):
                 # Not a defect of the citation chain: the match is real but it
                 # is in the title, tags or description, and the schema has no
                 # citable unit for metadata. Counted apart from failures.
