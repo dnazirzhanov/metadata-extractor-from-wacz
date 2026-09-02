@@ -54,8 +54,8 @@ class TestPreference:
 
 class TestFallback:
     def test_the_sidecar_is_used_only_when_the_archive_has_none(self, tmp_path):
-        # ripost.hu's crawl predates --screenshot, so for that outlet a sidecar
-        # is the normal case and not a defect.
+        # Captures from before --screenshot was enabled hold no screenshot of
+        # their own, so the backfill sidecar is the normal case for them.
         choice = choose(tmp_path, [HTML], sidecar="screenshot.webp")
         assert choice is not None
         assert not choice.from_browsertrix

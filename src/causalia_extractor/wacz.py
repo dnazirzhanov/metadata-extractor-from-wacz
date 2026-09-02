@@ -165,9 +165,17 @@ def _pick_main_html(records: list[_HtmlRecord],
 def find_backfilled_screenshot(wacz_path: Path) -> Path | None:
     """The screenshot sitting beside this archive, if the backfill ran.
 
-    For ripost.hu this is the normal case: that crawl ran without
-    ``--screenshot`` and every page got a ``screenshot.webp`` neighbour from the
-    backfill that completed 2026-08-07. It is not a defect.
+    The first crawl ran without ``--screenshot``, so its captures hold no
+    screenshot of their own; the Playwright backfill that completed 2026-08-07
+    wrote a ``screenshot.webp`` beside each one. This is keyed on CAPTURE DATE,
+    not on outlet - ripost.hu fills that early cohort only because it was
+    crawled first, and its later captures carry an ordinary in-archive
+    screenshot. A sidecar on an early capture is normal, not a defect.
+
+    The backfill is not known to be complete: 2 of the 3 pre-switch captures on
+    hand have no sidecar. Returning None for an early capture therefore means
+    that page was missed by the backfill, which is worth chasing rather than
+    papering over here.
     """
     for name in BACKFILL_SCREENSHOT_NAMES:
         candidate = wacz_path.parent / name

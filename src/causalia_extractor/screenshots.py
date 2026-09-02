@@ -19,8 +19,17 @@ PREFERENCE ORDER, best first:
 6. ``screenshot.webp`` beside the .wacz, from the 2026-08-07 Playwright backfill
 
 1-5 are Browsertrix's own captures and are always preferred over 6. 6 exists
-because the ripost.hu crawl ran before ``--screenshot`` was enabled, so for that
-outlet a sidecar is the normal case and not a defect.
+because the first crawl ran before ``--screenshot`` was enabled: those captures
+hold no screenshot of their own, so the 2026-08-07 Playwright backfill wrote one
+beside each. The split is by CAPTURE DATE, not by outlet - ripost.hu fills the
+early cohort only because it was crawled first, and its later captures carry an
+ordinary ``urn:fullPage`` like everyone else. Measured over 51 captures: nothing
+captured up to 2026-08-05 08:28 has an in-archive screenshot, everything from
+2026-08-12 11:29 on does; the switch was thrown somewhere in that gap.
+
+A sidecar on an early capture is therefore normal. Its ABSENCE on one is a
+backfill gap rather than a property of the crawl - 2 of the 3 early captures in
+that sample have no sidecar, and ``choose`` returns None for them.
 
 Exactly one screenshot is written. Nothing is re-rendered: this extractor never
 starts a browser.

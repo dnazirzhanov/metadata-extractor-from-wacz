@@ -147,8 +147,9 @@ class TestScreenshotsOnRealData:
             assert len(shots) <= 1, f"{directory.name}: {shots}"
 
     def test_browsertrix_captures_are_preferred_over_the_sidecar(self, extracted):
-        # Wave-3/4 captures carry a urn:fullPage PNG; the older ripost.hu crawl
-        # ran before --screenshot and has only the backfill webp.
+        # Wave-3/4 captures carry a urn:fullPage PNG; wave-1 ones predate
+        # --screenshot and have only the backfill webp. The testset's wave-1
+        # example happens to be ripost.hu, the outlet that was crawled first.
         output, _ = extracted
         suffixes = {p.suffix for d in articles(output)
                     for p in d.glob("screenshot.*")}
