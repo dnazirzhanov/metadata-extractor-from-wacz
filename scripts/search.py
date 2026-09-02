@@ -2,10 +2,10 @@
 """The first query layer: PostgreSQL full-text search over the corpus.
 
 Deliberately only Postgres. No embeddings, no vector similarity, no external
-engine - the point is to measure how far `hungarian_ci` + GIN takes us before
-adding anything.
+engine - the point is to measure how far the corpus search vectors + GIN take
+us before adding anything.
 
-No DDL. Every function here is a query over columns migrations 001-006 already
+No DDL. Every function here is a query over columns migrations 001-007 already
 created, so the approved schema stays frozen:
 
     article.search_tsv        title(A) subtitle(B) description(B) authors(C) tags(C)
@@ -33,7 +33,21 @@ import psycopg2.extras
 DEFAULT_DSN = ("host=127.0.0.1 port=55433 user=causalia password=dev "
                "dbname=causalia_dev")
 
-CONFIG = "corpus.hungarian_ci"
+#: Queries go through corpus.search_query(), not websearch_to_tsquery(): the
+#: vectors hold two lexemes per word (unaccented lemma + unaccented surface) and
+#: a query has to be expanded into the matching per-term alternation. See
+#: migrations/007.
+QUERY = "corpus.search_query"
+
+#: ts_headline takes ONE configuration, so it cannot reproduce the union the
+#: vectors are built from. The surface configuration is the safe half: it
+#: highlights a word only when the accent-folded spelling really matches, so an
+#: inflected form matched via the lemma side goes un-highlighted. That is the
+#: right way to be wrong here - this project refuses to point at a passage it
+#: cannot verify, and under-highlighting is a cosmetic loss where highlighting
+#: the wrong word (hungarian_ci would offer "orra" for a query about "Orbán")
+#: is a fabricated citation.
+HEADLINE_CONFIG = "corpus.hungarian_surface"
 
 #: A headline is for a human reading a result list; the block's full text is
 #: returned beside it so an agent never has to parse the markers.
@@ -55,15 +69,15 @@ def _blocks_for(cur, article_id: int, query: str, limit: int) -> list[dict]:
     """
     cur.execute(f"""
         SELECT b.block_index, b.block_type, b.xpath, b.block_text,
-               ts_rank(b.text_tsv, websearch_to_tsquery('{CONFIG}', %(q)s)) AS rank,
-               ts_headline('{CONFIG}', b.block_text,
-                           websearch_to_tsquery('{CONFIG}', %(q)s),
+               ts_rank(b.text_tsv, {QUERY}(%(q)s)) AS rank,
+               ts_headline('{HEADLINE_CONFIG}', b.block_text,
+                           {QUERY}(%(q)s),
                            %(opts)s) AS headline
         FROM corpus.content_block b
         JOIN corpus.article a ON a.id = b.article_id
         WHERE b.article_id = %(id)s
           AND b.extraction_id = a.current_extraction_id
-          AND b.text_tsv @@ websearch_to_tsquery('{CONFIG}', %(q)s)
+          AND b.text_tsv @@ {QUERY}(%(q)s)
         ORDER BY rank DESC, b.block_index
         LIMIT %(limit)s
     """, {"id": article_id, "q": query, "opts": HEADLINE_OPTS, "limit": limit})
@@ -79,7 +93,7 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
     prose - the matching blocks with the selector needed to cite them.
     """
     cur.execute(f"""
-        WITH q AS (SELECT websearch_to_tsquery('{CONFIG}', %(query)s) AS tsq)
+        WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
@@ -129,13 +143,13 @@ def search_article_content(cur, query: str, *, limit: int = 20) -> list[dict]:
     cur.execute(f"""
         SELECT b.id AS block_id, b.article_id, a.title, a.outlet, a.url_hash,
                b.block_index, b.block_type, b.xpath, b.block_text,
-               ts_rank(b.text_tsv, websearch_to_tsquery('{CONFIG}', %(q)s)) AS rank,
-               ts_headline('{CONFIG}', b.block_text,
-                           websearch_to_tsquery('{CONFIG}', %(q)s), %(opts)s) AS headline
+               ts_rank(b.text_tsv, {QUERY}(%(q)s)) AS rank,
+               ts_headline('{HEADLINE_CONFIG}', b.block_text,
+                           {QUERY}(%(q)s), %(opts)s) AS headline
         FROM corpus.content_block b
         JOIN corpus.article a ON a.id = b.article_id
         WHERE b.extraction_id = a.current_extraction_id
-          AND b.text_tsv @@ websearch_to_tsquery('{CONFIG}', %(q)s)
+          AND b.text_tsv @@ {QUERY}(%(q)s)
         ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index
         LIMIT %(limit)s
     """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit})

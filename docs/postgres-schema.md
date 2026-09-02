@@ -494,16 +494,69 @@ ALTER  TEXT SEARCH CONFIGURATION hungarian_ci
   ALTER MAPPING FOR hword, hword_part, word WITH unaccent, hungarian_stem;
 ```
 
-`hungarian_ci` is the config every vector below uses. It must be created **before**
+> **Superseded by migration 007.** The reasoning above is sound about the
+> problem and wrong about the fix — see D.1.2. `hungarian_ci` still exists but
+> no vector uses it. The rest of this section (immutability, the config being
+> part of the schema contract, a change being a migration rather than a tweak)
+> applies unchanged to what replaced it.
+
+`hungarian_ci` was the config every vector used. It must be created **before**
 any generated column references it, and it must never be altered afterwards — a
 stored `tsvector` is not recomputed by an `ALTER CONFIGURATION`, so changing it
 silently desynchronizes the index from the data. Changing it later means a
 rewrite of both vectors, which is a migration, not a tweak.
 
 One caveat to state plainly: a stored generated column requires the config to be
-`IMMUTABLE`-referenced by name, which Postgres permits, but it also means
-`hungarian_ci` becomes part of the schema's contract. That is the right trade for
+`IMMUTABLE`-referenced by name, which Postgres permits, but it also means the
+config becomes part of the schema's contract. That is the right trade for
 correct Hungarian search.
+
+### D.1.2 Why `unaccent → hungarian_stem` was the wrong order
+
+Putting `unaccent` in front of the stemmer hands the stemmer text that is **no
+longer Hungarian**. Snowball then strips whatever the accent-free spelling makes
+look like a suffix:
+
+| word | `hungarian_ci` lexeme | |
+| --- | --- | --- |
+| `Orbán` | `or` | `-ban` read as the inessive case |
+| `orra` ("nose") | `or` | …so the two collide |
+| `Orbánnak` | `orban` | …and matches neither |
+| `Magyarország` | `magyarorszag` | |
+| `Magyarországról` | `magyarorszagrol` | the pair never unifies |
+
+The damage is not uniform — `kormány`/`kormányban` unify correctly while
+`Orbán`/`Orbánnak` do not — so the behaviour cannot be predicted from the query,
+which is the worst property a search system can have. On the 36-article dev
+corpus `Magyarországról` returned 2 articles of 20 and `Orbánnak` returned none.
+
+Accent-insensitivity and stemming are two jobs, and one lexeme per word cannot
+do both. **007 indexes two**, unioned into the same vector:
+
+| | built from | `kormányban` → |
+| --- | --- | --- |
+| lemma | stem the accented text, *then* fold accents off the lemma | `kormany` |
+| surface | fold accents off the word, no stemming | `kormanyban` |
+
+A query is expanded the same way and alternated per term — `kormányban` becomes
+`('kormany' | 'kormanyban')` — so the lemma side carries inflection, the surface
+side carries accent-free spelling, and neither can be broken by the other's
+failure mode. `corpus.search_vector()` builds the vector, `corpus.search_query()`
+builds the query, and the two must always change together.
+
+Measured over 19 probe queries against an accent-folded substring yardstick
+computed in Python (`scripts/stemming_lab.py`, so no configuration can score
+well by agreeing with itself): recall **70.2% → 93.1%**, precision
+**93.4% → 95.2%**, both GIN indexes roughly doubling. Six other candidates were
+scored, including two built on hunspell `hu_HU`; they are tabulated in the
+header of `migrations/007_search_recall.sql`. The two hunspell options were
+rejected for needing dictionary files in `$SHAREDIR/tsearch_data` inside the db
+container on milab2, surviving every rebuild, to buy 1.2 points of recall and
+lose 4.2 of precision.
+
+The cost is real: two lexemes per word, and rebuilding the generated columns
+rewrites every row of both tables — ~58M blocks and ~11.7 GB of text in
+production. This is a maintenance-window migration, not an online one.
 
 ### D.1.1 A generated column needs strict immutability
 
@@ -536,11 +589,11 @@ config is spelled out everywhere.
 **`article.search_tsv`** — for *finding articles*:
 
 ```sql
-setweight(to_tsvector('hungarian_ci', coalesce(title,'')),                   'A') ||
-setweight(to_tsvector('hungarian_ci', coalesce(subtitle,'')),                'B') ||
-setweight(to_tsvector('hungarian_ci', coalesce(description,'')),             'B') ||
-setweight(to_tsvector('hungarian_ci', array_to_string(authors,' ')),         'C') ||
-setweight(to_tsvector('hungarian_ci', array_to_string(tags,' ')),            'C')
+setweight(corpus.search_vector(coalesce(title,'')),                          'A') ||
+setweight(corpus.search_vector(coalesce(subtitle,'')),                       'B') ||
+setweight(corpus.search_vector(coalesce(description,'')),                    'B') ||
+setweight(corpus.search_vector(corpus.text_array_to_string(authors)),        'C') ||
+setweight(corpus.search_vector(corpus.text_array_to_string(tags)),           'C')
 ```
 
 Weights are the point: a title hit must outrank a tag hit. This also gives fuzzy
@@ -549,7 +602,7 @@ author and tag search for free, which is why there is no separate author index.
 **`content_block.text_tsv`** — for *finding and citing passages*:
 
 ```sql
-to_tsvector('hungarian_ci', coalesce(text,''))
+corpus.search_vector(coalesce(text,''))
 ```
 
 **There is deliberately no third vector over the whole article body.**
@@ -899,6 +952,8 @@ The crawler must not be touched. Four properties make that true by construction:
 `scripts/migrate.sh` or plain `psql -f`:
 
 ```
+007_search_recall.sql       hungarian_lemma + hungarian_surface configs,
+                            search_vector, search_query; rebuilds both vectors
 001_corpus_schema.sql       schema, ledger, unaccent, corpus.hungarian_ci,
                             the immutable array helper (§D.1.1)
 002_article.sql             article + article_extraction (the spine)
