@@ -68,7 +68,8 @@ def _blocks_for(cur, article_id: int, query: str, limit: int) -> list[dict]:
     passages from a reading nobody can cite any more.
     """
     cur.execute(f"""
-        SELECT b.block_index, b.block_type, b.xpath, b.block_text,
+        SELECT b.id AS block_id,
+               b.block_index, b.block_type, b.xpath, b.block_text,
                ts_rank(b.text_tsv, {QUERY}(%(q)s)) AS rank,
                ts_headline('{HEADLINE_CONFIG}', b.block_text,
                            {QUERY}(%(q)s),
