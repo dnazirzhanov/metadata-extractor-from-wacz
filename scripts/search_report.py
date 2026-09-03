@@ -96,15 +96,56 @@ def corpus_index(cur) -> dict:
 
 
 def substring_hits(corpus: dict, query: str) -> set[int]:
-    """Articles containing every term as a plain substring. A crude upper bound
-    on what a lexeme search can find, and the yardstick for recall."""
+    """Articles where every query term STARTS A WORD. The yardstick for recall.
+
+    Word-initial, not "anywhere in the string". A bare substring test is wrong
+    in Hungarian and wrong in a way that inflates exactly the number this report
+    exists to show. -ban/-ben is the inessive case ending, so the accent-folded
+    spelling of "Orbán" occurs inside elsősorban, műsorban, szektorban,
+    táborban, korban - measured on the 1,008-article evaluation corpus, a
+    substring yardstick reported 79 recall misses for the query "Orbán" and
+    every single one of them was a word like "elsősorban". The search engine was
+    right and the ruler was wrong.
+
+    Matching word-initially keeps the property that makes the yardstick worth
+    having - it is computed in Python, independently of anything Postgres does,
+    so no text-search configuration can score well by agreeing with itself -
+    while removing a systematic bias against every query ending in a sequence
+    the stemmer can read as a suffix.
+    """
     terms = [fold(t) for t in re.split(r"[\s\-]+", query) if t]
     return {aid for aid, doc in corpus.items()
-            if all(t in doc["haystack"] for t in terms)}
+            if all(_starts_a_word(doc["haystack"], t) for t in terms)}
+
+
+def _starts_a_word(haystack: str, term: str) -> bool:
+    """True when `term` occurs in `haystack` at the start of a word.
+
+    Both are already accent-folded. A word starts at the beginning of the string
+    or after any character that is not a letter, a digit or an underscore.
+    """
+    if not term:
+        return False
+    start = haystack.find(term)
+    while start != -1:
+        if start == 0 or not (haystack[start - 1].isalnum()
+                              or haystack[start - 1] == "_"):
+            return True
+        start = haystack.find(term, start + 1)
+    return False
 
 
 def lexemes_for(cur, word: str) -> str:
-    cur.execute("SELECT to_tsvector('corpus.hungarian_ci', %s)::text", (word,))
+    """The lexemes the LIVE search actually indexes for a word.
+
+    corpus.search_vector, not corpus.hungarian_ci. 007 retired that
+    configuration - it is still installed only because ts_headline callers may
+    name it - so reporting its lexemes here explained misses in terms of an
+    engine that has not been running since. Every word now contributes two
+    lexemes, the unaccented lemma and the unaccented surface form, and seeing
+    both is the point: it is usually the lemma that explains a surprise.
+    """
+    cur.execute("SELECT corpus.search_vector(%s)::text", (word,))
     raw = cur.fetchone()[0]
     return " ".join(re.findall(r"'([^']+)'", raw)) or "(none)"
 
@@ -127,7 +168,7 @@ def explain_miss(cur, corpus: dict, article_id: int, query: str) -> dict:
     texts.append(cur.fetchone()[0])
     for text in texts:
         for word in re.findall(r"[\wÀ-ɏ]+", text):
-            if term in fold(word):
+            if fold(word).startswith(term):
                 return {"word": word, "lexeme": lexemes_for(cur, word),
                         "query_lexeme": lexemes_for(cur, query)}
     return {"word": "(not located)", "lexeme": "", "query_lexeme": lexemes_for(cur, query)}
@@ -139,7 +180,12 @@ def collect(cur, dict_cur) -> dict:
 
     for query, why, base in QUERIES:
         started = time.perf_counter()
+        # DISPLAY is the top 50; RECALL is measured against the complete match
+        # set. Comparing the truncated list against an unlimited yardstick
+        # counts every article below the cut as a miss - on this corpus that
+        # reported 546 misses where there were 13.
         rows = S.search_articles(dict_cur, query, limit=50, blocks_per_article=4)
+        returned_all = S.matching_ids(dict_cur, query)
         latency = (time.perf_counter() - started) * 1000
 
         dict_cur.execute(
@@ -179,7 +225,7 @@ def collect(cur, dict_cur) -> dict:
             })
 
         misses = []
-        for article_id in sorted(substrings - returned):
+        for article_id in sorted(substrings - returned_all):
             doc = corpus[article_id]
             misses.append({
                 "title": doc["title"], "outlet": doc["outlet"],
@@ -201,8 +247,9 @@ def collect(cur, dict_cur) -> dict:
         report["queries"].append({
             "query": query, "why": why, "parsed": parsed, "comparison": comparison,
             "latency_ms": round(latency, 2),
-            "returned": len(returned), "substring": len(substrings),
-            "stem_only": sorted(returned - substrings),
+            "returned": len(returned), "returned_all": len(returned_all),
+            "substring": len(substrings),
+            "stem_only": sorted(returned_all - substrings),
             "results": results, "misses": misses,
         })
 
