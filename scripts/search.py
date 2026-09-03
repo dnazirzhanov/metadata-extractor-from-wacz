@@ -19,8 +19,16 @@ that choice is that whole-document ts_rank is unavailable, so the article score
 combines the metadata rank with the best matching block's rank - for a citation
 tool the best passage is what you want to surface anyway.
 
+Filters (--author, --section, --from/--to) are EXACT and are applied as
+predicates, never as full-text. --phrase is different in kind: it is a recheck
+over the same candidate set the index already produced, because the stored
+vectors cannot answer a positional question (migrations/009).
+
 Usage:  scripts/search.py "Orbán Viktor" [--outlet origo.hu] [--tag Magyarország]
+        scripts/search.py "Orbán Viktor" --phrase
+        scripts/search.py "kormány" --author "Nagy Márton" --from 2026-01-01
         scripts/search.py --tag-only "Magyarország"
+        scripts/search.py --author-only "Nagy Márton"
 """
 
 from __future__ import annotations
@@ -51,6 +59,60 @@ QUERY = "corpus.search_query"
 #: is a fabricated citation.
 HEADLINE_CONFIG = "corpus.hungarian_surface"
 
+#: Phrase search is a RECHECK, never the primary matcher. corpus.search_query
+#: still runs first and is still served by the GIN index; corpus.phrase_match
+#: then re-tests the survivors with document-order vectors. Doing it the other
+#: way round forces a sequential scan over every block, and using <-> against
+#: the stored vector is simply wrong - it can fabricate an adjacency that is not
+#: in the text. Both are explained at length in migrations/009_search_filters.sql.
+PHRASE = "corpus.phrase_match"
+
+#: An article's METADATA hit. Under --phrase the prose fields are rechecked as
+#: one string, and each tag and each author is rechecked SEPARATELY.
+#:
+#: Testing the arrays element by element rather than joined is the whole point.
+#: Joining them would let a phrase straddle two independent tags - an adjacency
+#: the page never printed - while skipping them altogether loses the case that
+#: motivated this: an article tagged exactly "orosz-ukrán háború" is the best
+#: possible answer to that phrase, and joining or skipping both get it wrong.
+META_HIT = (
+    "(a.search_tsv @@ q.tsq AND (NOT %(phrase)s"
+    " OR " + PHRASE + "(concat_ws(' ', a.title, a.subtitle, a.description),"
+    " %(query)s)"
+    " OR EXISTS (SELECT 1 FROM unnest(a.tags) AS tg"
+    "             WHERE " + PHRASE + "(tg, %(query)s))"
+    " OR EXISTS (SELECT 1 FROM unnest(a.authors) AS au"
+    "             WHERE " + PHRASE + "(au, %(query)s))))")
+
+#: The match predicate itself, shared by search_articles() and matching_ids().
+#: Two copies of a WHERE clause is how a ranked result list and the recall set
+#: measured against it quietly stop meaning the same thing - the same argument
+#: that put the ingestion INSERTs in one module (scripts/cx_ingest.py).
+#: Expects a CTE `q` holding the tsquery, and the same parameter names.
+MATCH_WHERE = ("(" + META_HIT + """
+               OR EXISTS (SELECT 1 FROM corpus.content_block b
+                           WHERE b.article_id = a.id
+                             AND b.extraction_id = a.current_extraction_id
+                             AND b.text_tsv @@ q.tsq
+                             AND (NOT %(phrase)s
+                                  OR {PHRASE_FN}(b.block_text, %(query)s)))
+               OR EXISTS (SELECT 1 FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ q.tsq
+                             AND (NOT %(phrase)s
+                                  OR {PHRASE_FN}(concat_ws(' ', i.caption, i.alt),
+                                              %(query)s))))
+          AND (%(outlet)s  IS NULL OR a.outlet = %(outlet)s)
+          AND (%(tag)s     IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
+          AND (%(author)s  IS NULL OR a.authors @> ARRAY[%(author)s]::text[])
+          AND (%(section)s IS NULL OR a.section = %(section)s)
+          AND (%(date_from)s IS NULL
+               OR a.published_at >= %(date_from)s::timestamptz)
+          AND (%(date_to)s IS NULL
+               OR a.published_at < (%(date_to)s::date + 1)::timestamptz)
+""".replace("{PHRASE_FN}", PHRASE))
+
 #: A headline is for a human reading a result list; the block's full text is
 #: returned beside it so an agent never has to parse the markers.
 HEADLINE_OPTS = ("MaxFragments=2,FragmentDelimiter= … ,"
@@ -61,7 +123,8 @@ def connect(dsn: str | None = None):
     return psycopg2.connect(dsn or os.environ.get("CX_DEV_DSN", DEFAULT_DSN))
 
 
-def _blocks_for(cur, article_id: int, query: str, limit: int) -> list[dict]:
+def _blocks_for(cur, article_id: int, query: str, limit: int,
+                phrase: bool = False) -> list[dict]:
     """The matching blocks of an article, best first.
 
     Restricted to the article's CURRENT extraction. Today superseded content is
@@ -81,14 +144,19 @@ def _blocks_for(cur, article_id: int, query: str, limit: int) -> list[dict]:
         WHERE b.article_id = %(id)s
           AND b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
+          AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
         ORDER BY rank DESC, b.block_index
         LIMIT %(limit)s
-    """, {"id": article_id, "q": query, "opts": HEADLINE_OPTS, "limit": limit})
+    """, {"id": article_id, "q": query, "opts": HEADLINE_OPTS, "limit": limit,
+          "phrase": phrase})
     return [dict(row) for row in cur.fetchall()]
 
 
 def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = None,
-                    tag: str | None = None, blocks_per_article: int = 3) -> list[dict]:
+                    tag: str | None = None, blocks_per_article: int = 3,
+                    author: str | None = None, section: str | None = None,
+                    date_from: str | None = None, date_to: str | None = None,
+                    phrase: bool = False) -> list[dict]:
     """Search article metadata, article prose AND image captions.
 
     Returns enough for a UI or an agent to act without a second round trip:
@@ -100,38 +168,44 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
     ranked but not cited. `match_reason` says `caption` when that is the ONLY
     reason the article came back, so a caller can tell "found the evidence" from
     "found the article" without inspecting the ranks.
+
+    `author`, `section` and the `date_from`/`date_to` range are EXACT predicates,
+    deliberately not full-text. An author is matched by set membership on the
+    authors array - the same argument as tags (docs/postgres-schema.md D.3): the
+    weight-C match in search_tsv also fires on tags and on body prose, so a
+    byline filter built on it would return articles the person did not write.
+
+    `phrase=True` additionally requires the query to appear as an adjacent word
+    sequence. It never replaces the tsquery - that still runs first, on the
+    index - it only removes survivors that matched as a bag of words.
+    `date_to` is INCLUSIVE of the whole day given.
     """
     cur.execute(f"""
         WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
-               a.search_tsv @@ q.tsq                       AS meta_match,
+               {META_HIT}                                  AS meta_match,
                ts_rank(a.search_tsv, q.tsq)                AS meta_rank,
                (SELECT max(ts_rank(b.text_tsv, q.tsq))
                   FROM corpus.content_block b
                  WHERE b.article_id = a.id
                    AND b.extraction_id = a.current_extraction_id
-                   AND b.text_tsv @@ q.tsq)                AS body_rank,
+                   AND b.text_tsv @@ q.tsq
+                   AND (NOT %(phrase)s
+                        OR {PHRASE}(b.block_text, %(query)s)))  AS body_rank,
                (SELECT max(ts_rank(i.caption_tsv, q.tsq))
                   FROM corpus.article_image i
                  WHERE i.article_id = a.id
                    AND i.extraction_id = a.current_extraction_id
-                   AND i.caption_tsv @@ q.tsq)             AS caption_rank
+                   AND i.caption_tsv @@ q.tsq
+                   AND (NOT %(phrase)s
+                        OR {PHRASE}(concat_ws(' ', i.caption, i.alt),
+                                    %(query)s)))               AS caption_rank
         FROM corpus.article a
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
-        WHERE (a.search_tsv @@ q.tsq
-               OR EXISTS (SELECT 1 FROM corpus.content_block b
-                           WHERE b.article_id = a.id
-                             AND b.extraction_id = a.current_extraction_id
-                             AND b.text_tsv @@ q.tsq)
-               OR EXISTS (SELECT 1 FROM corpus.article_image i
-                           WHERE i.article_id = a.id
-                             AND i.extraction_id = a.current_extraction_id
-                             AND i.caption_tsv @@ q.tsq))
-          AND (%(outlet)s IS NULL OR a.outlet = %(outlet)s)
-          AND (%(tag)s   IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
+        WHERE {MATCH_WHERE}
         ORDER BY (ts_rank(a.search_tsv, q.tsq)
                   + coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
                                 FROM corpus.content_block b
@@ -145,7 +219,9 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                                  AND i.caption_tsv @@ q.tsq), 0)) DESC,
                  a.published_at DESC NULLS LAST
         LIMIT %(limit)s
-    """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit})
+    """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit,
+          "author": author, "section": section, "phrase": phrase,
+          "date_from": date_from, "date_to": date_to})
 
     results = []
     for row in cur.fetchall():
@@ -160,13 +236,41 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
             else "metadata" if hit["meta_match"]
             else "body" if hit["body_rank"]
             else "caption")
-        hit["blocks"] = (_blocks_for(cur, hit["id"], query, blocks_per_article)
+        hit["blocks"] = (_blocks_for(cur, hit["id"], query, blocks_per_article,
+                                     phrase=phrase)
                          if hit["body_rank"] else [])
         results.append(hit)
     return results
 
 
-def search_article_content(cur, query: str, *, limit: int = 20) -> list[dict]:
+def matching_ids(cur, query: str, *, outlet: str | None = None,
+                 tag: str | None = None, author: str | None = None,
+                 section: str | None = None, date_from: str | None = None,
+                 date_to: str | None = None, phrase: bool = False) -> set[int]:
+    """Every article id the query matches - no ranking, no headlines, no LIMIT.
+
+    Recall measurement needs the COMPLETE set. Comparing a LIMITed result list
+    against an unlimited yardstick counts everything below the cut as a recall
+    miss, which is not a measurement of anything. On the 1,008-article
+    evaluation corpus that mistake turned 13 real misses into 546 reported
+    ones, because Magyarorszag matches 254 articles and the list stopped at 50.
+
+    Use this for "did it find them"; use search_articles for "what to show".
+    """
+    cur.execute(f"""
+        WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
+        SELECT a.id
+        FROM corpus.article a
+        CROSS JOIN q
+        WHERE {MATCH_WHERE}
+    """, {"query": query, "outlet": outlet, "tag": tag, "author": author,
+          "section": section, "phrase": phrase,
+          "date_from": date_from, "date_to": date_to})
+    return {row[0] for row in cur.fetchall()}
+
+
+def search_article_content(cur, query: str, *, limit: int = 20,
+                           phrase: bool = False) -> list[dict]:
     """Block-level search: the citable unit, straight out."""
     cur.execute(f"""
         SELECT b.id AS block_id, b.article_id, a.title, a.outlet, a.url_hash,
@@ -178,9 +282,10 @@ def search_article_content(cur, query: str, *, limit: int = 20) -> list[dict]:
         JOIN corpus.article a ON a.id = b.article_id
         WHERE b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
+          AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
         ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index
         LIMIT %(limit)s
-    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit})
+    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit, "phrase": phrase})
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -198,6 +303,23 @@ def filter_by_tag(cur, tag: str, *, limit: int = 50) -> list[dict]:
         ORDER BY published_at DESC NULLS LAST
         LIMIT %(limit)s
     """, {"tag": tag, "limit": limit})
+    return [dict(row) for row in cur.fetchall()]
+
+
+def filter_by_author(cur, author: str, *, limit: int = 50) -> list[dict]:
+    """Exact byline filter, served by article_authors_idx (migration 009).
+
+    Kept separate from full-text for the same reason as filter_by_tag: the
+    weight-C match in search_tsv also fires on tags and on body prose, so it
+    answers "mentions this person", not "was written by them".
+    """
+    cur.execute("""
+        SELECT id, url_hash, title, outlet, published_at, canonical_url, authors
+        FROM corpus.article
+        WHERE authors @> ARRAY[%(author)s]::text[]
+        ORDER BY published_at DESC NULLS LAST
+        LIMIT %(limit)s
+    """, {"author": author, "limit": limit})
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -224,9 +346,23 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--dsn", default=None)
     parser.add_argument("--outlet", default=None)
     parser.add_argument("--tag", default=None)
+    parser.add_argument("--author", default=None,
+                        help="exact byline filter (set membership on authors)")
+    parser.add_argument("--section", default=None, help="exact section filter")
+    # 'from' is a keyword, so the flag and the attribute have to differ.
+    parser.add_argument("--from", dest="date_from", default=None,
+                        metavar="YYYY-MM-DD", help="published on or after")
+    parser.add_argument("--to", dest="date_to", default=None,
+                        metavar="YYYY-MM-DD",
+                        help="published on or before (inclusive of that day)")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--phrase", action="store_true",
+                        help="require the query as an adjacent word sequence, "
+                             "not as a bag of words")
     parser.add_argument("--tag-only", action="store_true",
                         help="exact tag filter instead of full-text search")
+    parser.add_argument("--author-only", action="store_true",
+                        help="exact byline filter instead of full-text search")
     parser.add_argument("--blocks", action="store_true",
                         help="block-level search instead of article search")
     args = parser.parse_args(argv[1:])
@@ -238,9 +374,17 @@ def main(argv: list[str]) -> int:
             print(f"== exact tag filter {args.query!r}: {len(rows)} article(s)")
             for row in rows:
                 print(f"   {row['outlet']:<16} {row['title']}")
+        elif args.author_only:
+            rows = filter_by_author(cur, args.query, limit=args.limit)
+            print(f"== exact byline filter {args.query!r}: {len(rows)} article(s)")
+            for row in rows:
+                print(f"   {str(row['published_at'])[:10]}  {row['outlet']:<16} "
+                      f"{row['title']}")
         elif args.blocks:
-            rows = search_article_content(cur, args.query, limit=args.limit)
-            print(f"== block search {args.query!r}: {len(rows)} block(s)")
+            rows = search_article_content(cur, args.query, limit=args.limit,
+                                          phrase=args.phrase)
+            kind = "phrase" if args.phrase else "block"
+            print(f"== {kind} search {args.query!r}: {len(rows)} block(s)")
             for row in rows:
                 print(f"\n   [{row['rank']:.4f}] {row['outlet']} block "
                       f"{row['block_index']} ({row['block_type']})")
@@ -248,8 +392,18 @@ def main(argv: list[str]) -> int:
                 print(f"   {row['xpath']}")
         else:
             rows = search_articles(cur, args.query, limit=args.limit,
-                                   outlet=args.outlet, tag=args.tag)
-            print(f"== search {args.query!r}: {len(rows)} article(s)")
+                                   outlet=args.outlet, tag=args.tag,
+                                   author=args.author, section=args.section,
+                                   date_from=args.date_from,
+                                   date_to=args.date_to, phrase=args.phrase)
+            active = [f"{k}={v}" for k, v in (
+                ("outlet", args.outlet), ("tag", args.tag),
+                ("author", args.author), ("section", args.section),
+                ("from", args.date_from), ("to", args.date_to)) if v]
+            if args.phrase:
+                active.insert(0, "phrase")
+            suffix = f"  [{', '.join(active)}]" if active else ""
+            print(f"== search {args.query!r}{suffix}: {len(rows)} article(s)")
             _print(rows)
     connection.close()
     return 0
