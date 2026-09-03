@@ -105,8 +105,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -727,10 +730,11 @@ def report_section_a(summary: dict) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--section", default="A", choices=["A"],
-                        help="only A exists so far")
-    parser.add_argument("--root", type=Path, required=True,
-                        help="extractor output tree to audit")
+    parser.add_argument("--section", default="A", choices=["A", "B"],
+                        help="A: chain of custody over real captures. "
+                             "B: adversarial synthetic archives (needs no corpus)")
+    parser.add_argument("--root", type=Path,
+                        help="extractor output tree to audit (section A only)")
     parser.add_argument("--pages-root", type=Path,
                         default=Path("/mnt/hdd/c0cshf/causalia/pages"),
                         help="corpus root, to locate each page.wacz")
@@ -741,6 +745,17 @@ def main(argv: list[str]) -> int:
                         help="JSON report (a .jsonl stream is written beside it)")
     args = parser.parse_args(argv[1:])
 
+    if args.section == "B":
+        # Section B builds its own inputs, so it needs no corpus and no --root.
+        report = run_section_b(args)
+        if args.out:
+            args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+            print(f"\n== wrote {args.out}")
+        return report_section_b(report)
+
+    if args.root is None:
+        parser.error("--root is required for section A")
     if not args.root.is_dir():
         raise SystemExit(f"--root is not a directory: {args.root}")
 
@@ -752,5 +767,345 @@ def main(argv: list[str]) -> int:
     return report_section_a(report["section_a"])
 
 
+
+# =====================================================================
+# SECTION B - ADVERSARIAL INPUTS
+# =====================================================================
+# Section A audits real captures, so it can only find the failures the corpus
+# happens to contain. Section B constructs the ones the extractor should
+# survive - including several this project has already been bitten by - and
+# checks the CONTRACT rather than the output: what the extractor promises when
+# handed something it cannot read.
+#
+# WHAT IS ASSERTED. Four things must hold for every input, however malformed.
+# They are contract violations rather than quality judgements, so a failure is
+# unambiguous:
+#
+#   B1  the process exits with a code from the documented set. cli.py defines
+#       exactly four: 0 all extracted, 1 at least one failed or nothing found,
+#       2 ArchiveMutated or UnsafeArtifact, 130 interrupted.
+#   B2  no unhandled traceback. Exit 1 is a legitimate answer; exit 1 because
+#       lxml raised through six frames is not - it means the failure was never
+#       anticipated, and the next malformed input may do something worse than
+#       exit.
+#   B3  the input archive is BYTE-IDENTICAL afterwards, by sha256. The
+#       extractor's own stat fence compares (size, mtime, inode) and explicitly
+#       declines to hash, because hashing every archive would mean a second full
+#       read of ~2.1 TB to defend against a threat those three already detect.
+#       That reasoning is right in production and wrong here, where an
+#       independent and strictly stronger check costs nothing on fourteen small
+#       files.
+#   B4  extraction.json, when written at all, carries a status from its enum.
+#
+# WHAT IS ONLY REPORTED. Several cases capture something that is not an article:
+# a 404 body, a 502 body, an age-gate interstitial. Whether the extractor should
+# REFUSE those is an open question for this project - "404-as-success" and
+# "5xx-as-success" are both recorded defect classes - and the answer is not
+# obviously "refuse", because a 404 page has real text and Readability will
+# extract it. Asserting a verdict here would be inventing policy inside a test
+# harness. So section B reports how many prose blocks came out of a capture that
+# holds no article, and leaves the judgement to someone who can decide what the
+# pipeline ought to do.
+#
+# The archives are built with the SAME builders the extractor's own suite uses,
+# imported from tests/conftest.py. A second builder would eventually disagree
+# with the first about what a WACZ looks like, and then this would be testing
+# its own fixtures.
+
+#: cli.py's documented exit codes. Anything else is undocumented behaviour.
+VALID_EXIT_CODES = {0, 1, 2, 130}
+
+#: extraction.json's own enum.
+VALID_EXTRACTION_STATUS = {"success", "partial", "failed"}
+
+#: Long enough that no navigation label or button reaches it, so "the extractor
+#: produced prose" cannot be satisfied by furniture.
+PROSE_BLOCK_CHARS = 120
+
+PNG_MAGIC = bytes([137, 80, 78, 71, 13, 10, 26, 10])
+MP4_MAGIC = bytes([0, 0, 0, 32]) + b"ftypmp42"
+
+
+def _builders():
+    """The extractor test suite's own WACZ builders."""
+    tests_dir = Path(__file__).resolve().parent.parent / "tests"
+    sys.path.insert(0, str(tests_dir))
+    import conftest                                        # noqa: PLC0415
+    return conftest
+
+
+def build_adversarial(directory: Path, spec: dict, cf) -> Path:
+    """Write one adversarial page.wacz and return its path."""
+    path = directory / "page.wacz"
+    kind = spec["kind"]
+
+    if kind == "raw":
+        path.write_bytes(spec["data"])
+        return path
+
+    if kind == "truncate":
+        cf.make_wacz(path, records=[
+            {"uri": cf.ARTICLE_URL, "content_type": "text/html",
+             "body": cf.html_document("<p>" + "szoveg " * 40 + "</p>")}])
+        whole = path.read_bytes()
+        path.write_bytes(whole[:int(len(whole) * spec["fraction"])])
+        return path
+
+    if kind == "records":
+        cf.make_wacz(path, records=spec["records"])
+        return path
+
+    if kind == "two_html":
+        cf.make_wacz(path, records=[
+            {"uri": cf.ARTICLE_URL, "content_type": "text/html",
+             "body": cf.html_document(spec["body"], title="Az igazi cikk")},
+            {"uri": cf.ARTICLE_URL + "?amp", "content_type": "text/html",
+             "body": cf.html_document("<p>Egy masik dokumentum.</p>",
+                                      title="A masik")}])
+        return path
+
+    if kind == "iso8859":
+        document = cf.html_document(spec["body"], title="Arvizturo tukorfurogep")
+        cf.make_wacz(path, records=[
+            {"uri": cf.ARTICLE_URL,
+             "content_type": "text/html; charset=iso-8859-2",
+             "body": document.encode("iso-8859-2", "replace")}])
+        return path
+
+    if kind == "video206":
+        video_tag = '<video src="https://ripost.hu/v.mp4"></video>'
+        cf.make_wacz(path, records=[
+            {"uri": cf.ARTICLE_URL, "content_type": "text/html",
+             "body": cf.html_document(spec["body"] + video_tag)},
+            {"uri": "https://ripost.hu/v.mp4", "content_type": "video/mp4",
+             "status": "206 Partial Content", "body": MP4_MAGIC,
+             "headers": {"Content-Range": "bytes 200-1000/98765"}}])
+        return path
+
+    if kind == "html":
+        document = cf.html_document(spec["body"],
+                                    title=spec.get("title", "Teszt cikk"))
+        cf.make_wacz(path, records=[
+            {"uri": cf.ARTICLE_URL, "content_type": "text/html",
+             "status": spec.get("status", "200 OK"), "body": document}],
+            include_pages=spec.get("include_pages", True))
+        return path
+
+    raise ValueError("unknown case kind: %s" % kind)
+
+
+def run_extractor(wacz_path: Path, out_dir: Path) -> tuple[int, str]:
+    """Run the real CLI in a subprocess, so exit codes are the real contract."""
+    repo = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, PYTHONPATH=str(repo / "src"))
+    done = subprocess.run(
+        [sys.executable, "-m", "causalia_extractor.cli", "extract",
+         "--input", str(wacz_path), "--output", str(out_dir),
+         "--log-level", "ERROR"],
+        capture_output=True, text=True, env=env, timeout=300)
+    return done.returncode, (done.stderr or "")
+
+
+def audit_adversarial(name: str, why: str, spec: dict, has_prose: bool,
+                      workdir: Path, cf) -> dict:
+    case_dir = workdir / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = case_dir / "out"
+    result: dict = {"case": name, "why": why, "expects_prose": has_prose,
+                    "status": "ok", "errors": []}
+
+    wacz_path = build_adversarial(case_dir, spec, cf)
+    before = hashlib.sha256(wacz_path.read_bytes()).hexdigest()
+
+    try:
+        code, stderr = run_extractor(wacz_path, out_dir)
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["errors"].append("the extractor did not terminate in 300s")
+        return result
+    result["exit_code"] = code
+
+    # B1 - a documented exit code
+    if code not in VALID_EXIT_CODES:
+        result["status"] = "contract"
+        result["errors"].append(
+            "exit %s is not one of %s" % (code, sorted(VALID_EXIT_CODES)))
+
+    # B2 - no unhandled traceback
+    if "Traceback (most recent call last)" in stderr:
+        result["status"] = "contract"
+        lines = [ln for ln in stderr.strip().splitlines() if ln.strip()]
+        result["errors"].append(
+            "unhandled traceback: %s" % (lines[-1][:120] if lines else "?"))
+
+    # B3 - the archive is untouched, checked independently of the stat fence
+    after = hashlib.sha256(wacz_path.read_bytes()).hexdigest()
+    result["archive_unchanged"] = (before == after)
+    if before != after:
+        result["status"] = "contract"
+        result["errors"].append("THE INPUT ARCHIVE WAS MODIFIED")
+
+    # ---- what actually came out --------------------------------------
+    directories = (sorted(p.parent for p in out_dir.rglob("content.json"))
+                   if out_dir.exists() else [])
+    result["articles"] = len(directories)
+    prose_blocks, extraction_status, title = 0, None, None
+    for directory in directories:
+        try:
+            document = json.loads(
+                (directory / "content.json").read_text(encoding="utf-8"))
+            blocks = document.get("blocks", [])
+        except (OSError, json.JSONDecodeError):
+            blocks = []
+        prose_blocks += sum(
+            1 for b in blocks if isinstance(b, dict)
+            and len(b.get("text") or "") >= PROSE_BLOCK_CHARS)
+        extraction = directory / "extraction.json"
+        if extraction.is_file():
+            try:
+                extraction_status = json.loads(
+                    extraction.read_text(encoding="utf-8")
+                ).get("extraction_status")
+            except (OSError, json.JSONDecodeError):
+                extraction_status = "(unreadable)"
+        article = directory / "article.json"
+        if article.is_file():
+            try:
+                title = json.loads(
+                    article.read_text(encoding="utf-8")).get("title")
+            except (OSError, json.JSONDecodeError):
+                title = None
+    result["prose_blocks"] = prose_blocks
+    result["extraction_status"] = extraction_status
+    result["title"] = title
+
+    # B4 - the status enum
+    if (extraction_status is not None
+            and extraction_status not in VALID_EXTRACTION_STATUS):
+        result["status"] = "contract"
+        result["errors"].append(
+            "extraction_status %r is not in %s"
+            % (extraction_status, sorted(VALID_EXTRACTION_STATUS)))
+
+    # REPORTED, never asserted - see the section header
+    if not has_prose and prose_blocks:
+        result["note"] = ("%d prose block(s) from a capture holding no article"
+                          % prose_blocks)
+    if has_prose and not prose_blocks:
+        result["note"] = "no prose extracted from a capture that has some"
+    return result
+
+
+def adversarial_cases(cf) -> list[tuple]:
+    """The adversarial corpus. Each entry: name, why, build spec, has_prose."""
+    article_body = ("<p>" + ("A kormany ma bejelentette a dontest. " * 6)
+                    + "</p><p>"
+                    + ("Az ellenzek szerint ez elfogadhatatlan. " * 6) + "</p>")
+    gate = "<div class='age-gate'><h1>18+</h1><p>Elmultal 18 eves?</p></div>"
+    crash = article_body + "<iframe src='' onload='this.src=\"x\"'></iframe>"
+    # U+0085 NEXT LINE and U+2028 LINE SEPARATOR, by codepoint: an invisible
+    # character in source is a bug waiting to happen (normalize.py's argument).
+    shredder = "Teszt" + chr(0x85) + "cikk" + chr(0x2028) + "folytatas"
+
+    return [
+        ("truncated_zip",
+         "a capture cut off mid-write, which a full disk produces",
+         {"kind": "truncate", "fraction": 0.6}, False),
+        ("not_a_zip", "four bytes named page.wacz - a failed download",
+         {"kind": "raw", "data": b"NOPE"}, False),
+        ("empty_file", "zero bytes - the other shape of a failed download",
+         {"kind": "raw", "data": b""}, False),
+        ("no_html_record",
+         "a capture holding only an image: nothing to extract",
+         {"kind": "records", "records": [
+             {"uri": "https://ripost.hu/x.png", "content_type": "image/png",
+              "body": PNG_MAGIC}]}, False),
+        ("redirect_only",
+         "the seed 301s and only the stub was captured - what _pick_main_html "
+         "exists for",
+         {"kind": "records", "records": [
+             {"uri": cf.ARTICLE_URL, "content_type": "text/html",
+              "status": "301 Moved Permanently", "body": "",
+              "headers": {"Location": "https://ripost.hu/elsewhere"}}]}, False),
+        ("error_404",
+         "a 404 body stored as a successful capture - 15,802 in this corpus",
+         {"kind": "html", "status": "404 Not Found",
+          "body": "<p>A keresett oldal nem talalhato.</p>"}, False),
+        ("error_502", "a 502 body, likewise",
+         {"kind": "html", "status": "502 Bad Gateway",
+          "body": "<p>Bad Gateway</p>"}, False),
+        ("age_gate",
+         "HTTP 200, full JSON-LD and OpenGraph, no article - the ripost "
+         "interstitial. Metadata extracts perfectly; the body does not exist",
+         {"kind": "html", "body": gate}, False),
+        ("nel_in_title",
+         "U+0085 and U+2028 in the title - the characters that shredded a JSON "
+         "Lines reader on this corpus once already",
+         {"kind": "html", "title": shredder, "body": article_body}, True),
+        ("no_pages_jsonl",
+         "no pages.jsonl, so the page URL must come from the WARC alone",
+         {"kind": "html", "body": article_body, "include_pages": False}, True),
+        ("two_html_records",
+         "two 200 documents in one capture - which one is the article?",
+         {"kind": "two_html", "body": article_body}, True),
+        ("iso8859_2",
+         "a charset that is not utf-8; decoding it wrongly turns every Hungarian "
+         "long vowel into a replacement character",
+         {"kind": "iso8859", "body": article_body}, True),
+        ("video_206",
+         "a 206 byte range, which is ONE FRAGMENT and not a playable file",
+         {"kind": "video206", "body": article_body}, True),
+        ("crash_iframe",
+         "iframe src='' with an onload that mutates src - the shape that "
+         "crashed browsertrix 1.7.1",
+         {"kind": "html", "body": crash}, True),
+    ]
+
+
+def run_section_b(args: argparse.Namespace) -> dict:
+    cf = _builders()
+    cases = adversarial_cases(cf)
+    print("== section B: %d adversarial archives" % len(cases))
+    results = []
+    with tempfile.TemporaryDirectory(prefix="cx-pressure-b-") as tmp:
+        workdir = Path(tmp)
+        for name, why, spec, has_prose in cases:
+            row = audit_adversarial(name, why, spec, has_prose, workdir, cf)
+            results.append(row)
+            mark = "ok" if row["status"] == "ok" else row["status"].upper()
+            print("   %-9s %-18s exit=%-4s articles=%-3s prose=%s"
+                  % (mark, name, row.get("exit_code"), row.get("articles"),
+                     row.get("prose_blocks")), flush=True)
+
+    failures = [r for r in results if r["status"] != "ok"]
+    return {"section_b": {"cases": len(results),
+                          "contract_failures": len(failures)},
+            "results": results}
+
+
+def report_section_b(payload: dict) -> int:
+    results = payload["results"]
+    print("\n== CONTRACT  (exit code, no traceback, archive untouched, status enum)")
+    bad = [r for r in results if r["status"] != "ok"]
+    if not bad:
+        print("   all %d cases hold" % len(results))
+    for row in bad:
+        print("   %-18s %s" % (row["case"], row["status"]))
+        for message in row["errors"]:
+            print("      %s" % message)
+
+    print("\n== BEHAVIOUR  (reported, not asserted - the section header says why)")
+    print("   %-18s %4s %5s %6s  %-8s %s"
+          % ("case", "exit", "arts", "prose", "status", "note"))
+    for row in results:
+        print("   %-18s %4s %5s %6s  %-8s %s"
+              % (row["case"], row.get("exit_code"), row.get("articles", 0),
+                 row.get("prose_blocks", 0), str(row.get("extraction_status")),
+                 row.get("note", "")))
+
+    unchanged = sum(1 for r in results if r.get("archive_unchanged"))
+    print("\n   %d/%d input archives byte-identical after extraction (sha256)"
+          % (unchanged, len(results)))
+    return 1 if bad else 0
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
