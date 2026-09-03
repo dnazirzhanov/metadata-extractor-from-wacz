@@ -213,11 +213,19 @@ def _image_extension(body: bytes) -> str:
     return ".png"
 
 
-def read_archive(wacz_path: Path, expected_url: str | None = None) -> ArchiveContents:
+def read_archive(wacz_path: Path, expected_url: str | None = None,
+                 html_only: bool = False) -> ArchiveContents:
     """Single read-only pass over a page.wacz.
 
     CSS/JS/font bodies are skipped WITHOUT being buffered - on a 6 MB archive
     they are most of the bytes and would only be discarded.
+
+    ``html_only`` additionally skips image and video bodies. Extraction needs
+    them, but a caller that only wants the captured DOCUMENT should not pay for
+    them: ``payloads`` holds every image and video body in memory at once, and
+    the largest archives in this corpus reach 1.9 GB of mostly video. The
+    screenshot is still collected - it is one record, and callers auditing a
+    capture generally want to know whether it has one.
     """
     contents = ArchiveContents()
     wacz_path = Path(wacz_path)
@@ -301,6 +309,10 @@ def read_archive(wacz_path: Path, expected_url: str | None = None) -> ArchiveCon
                             content_type=content_type))
                         continue
 
+                    if html_only:
+                        # Not buffered, not decompressed: skipped outright.
+                        continue
+
                     if (content_type_main.startswith(("image/", "video/"))
                             or content_type_main in VIDEO_EXTENSION_BY_TYPE):
                         status, content_range = "", None
@@ -320,19 +332,22 @@ def read_archive(wacz_path: Path, expected_url: str | None = None) -> ArchiveCon
     return contents
 
 
-def read_archive_for_page(wacz_path: Path) -> ArchiveContents:
+def read_archive_for_page(wacz_path: Path,
+                          html_only: bool = False) -> ArchiveContents:
     """``read_archive`` plus the re-read that pins the right HTML document.
 
     The first pass is needed to learn the page URL from pages.jsonl; only if the
     HTML we happened to grab is NOT that page do we pay for a second pass. On a
     well-formed capture that second read never happens.
+
+    ``html_only`` is passed through - see ``read_archive``.
     """
-    contents = read_archive(wacz_path)
+    contents = read_archive(wacz_path, html_only=html_only)
     page_url = contents.page_url
     if not page_url:
         return contents
     if contents.main_url and normalize_url(contents.main_url) != normalize_url(page_url):
-        return read_archive(wacz_path, expected_url=page_url)
+        return read_archive(wacz_path, expected_url=page_url, html_only=html_only)
     return contents
 
 
