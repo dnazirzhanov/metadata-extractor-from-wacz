@@ -95,6 +95,14 @@ HEADLINE_CONFIG = "corpus.hungarian_surface"
 #: way round forces a sequential scan over every block, and using <-> against
 #: the stored vector is simply wrong - it can fabricate an adjacency that is not
 #: in the text. Both are explained at length in migrations/009_search_filters.sql.
+#:
+#: The prefilter is here for SPEED, and only speed: measured, it cuts 9,210
+#: blocks to 27-571 candidates and the phrase path from ~1030ms to ~21ms. It
+#: used to be load-bearing for CORRECTNESS too, without saying so - until 014,
+#: corpus.phrase_match bypassed 010's lemma guard and matched 'orra' (a nose)
+#: for the needle 'Orban'. The AND with this prefilter hid that completely. 014
+#: guards the verifier itself, so the two now agree standalone as well as
+#: combined, and dropping the prefilter would cost latency rather than truth.
 PHRASE = "corpus.phrase_match"
 
 #: An article's METADATA hit. Since 012 this no longer GATES matching - the
