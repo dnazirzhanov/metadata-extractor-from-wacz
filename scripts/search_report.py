@@ -9,7 +9,7 @@ articles that CONTAIN the term but were not returned, with the lexeme that
 explains why.
 
 Nothing is simulated. Every number and every snippet on the page came out of
-Postgres; the substring counts beside them are computed in Python precisely so
+Postgres; the yardstick counts beside them are computed in Python precisely so
 the two can disagree in public.
 
 Usage:
@@ -91,48 +91,88 @@ def corpus_index(cur) -> dict:
             "published_at": str(row["published_at"] or "")[:10],
             "meta_folded": fold(meta), "body_folded": fold(row["body"] or ""),
             "haystack": fold(meta + " " + (row["body"] or "")),
+            # The RAW text, and its words, kept so the yardstick can test a term
+            # accent-exactly. fold() everywhere was why it could not: the
+            # accented original was thrown away before anything could look at it.
+            **_word_sets(meta + " " + (row["body"] or "")),
         }
     return out
 
 
-def substring_hits(corpus: dict, query: str) -> set[int]:
-    """Articles where every query term STARTS A WORD. The yardstick for recall.
+def _word_sets(text: str) -> dict:
+    """The article's words, three ways, for the three yardstick tiers.
 
-    Word-initial, not "anywhere in the string". A bare substring test is wrong
-    in Hungarian and wrong in a way that inflates exactly the number this report
-    exists to show. -ban/-ben is the inessive case ending, so the accent-folded
-    spelling of "Orbán" occurs inside elsősorban, műsorban, szektorban,
-    táborban, korban - measured on the 1,008-article evaluation corpus, a
-    substring yardstick reported 79 recall misses for the query "Orbán" and
-    every single one of them was a word like "elsősorban". The search engine was
-    right and the ruler was wrong.
-
-    Matching word-initially keeps the property that makes the yardstick worth
-    having - it is computed in Python, independently of anything Postgres does,
-    so no text-search configuration can score well by agreeing with itself -
-    while removing a systematic bias against every query ending in a sequence
-    the stemmer can read as a suffix.
+    Letters only, so a hyphen, a slash and punctuation are all boundaries -
+    which is what makes "orosz" a whole word inside "orosz-ukrán" and NOT a
+    whole word inside "Oroszországgal".
     """
-    terms = [fold(t) for t in re.split(r"[\s\-]+", query) if t]
-    return {aid for aid, doc in corpus.items()
-            if all(_starts_a_word(doc["haystack"], t) for t in terms)}
+    words = re.findall(r"[^\W\d_]+", text or "", re.UNICODE)
+    lowered = {w.lower() for w in words}
+    return {"words_lower": lowered,
+            "words_folded": {fold(w) for w in lowered},
+            "text_folded": fold(text or "")}
 
 
-def _starts_a_word(haystack: str, term: str) -> bool:
-    """True when `term` occurs in `haystack` at the start of a word.
+def yardstick(corpus: dict, query: str) -> dict:
+    """The independent ground truth, in three tiers. Python only, raw text only.
 
-    Both are already accent-folded. A word starts at the beginning of the string
-    or after any character that is not a letter, a digit or an underscore.
+    The point of this function is that NO configuration of Postgres can score
+    well by agreeing with it. That stopped being true twice today:
+
+    * 015 matches a long lexeme as a PREFIX, to reach Hungarian closed compounds
+      (koronavírus -> koronavírusteszt). The old yardstick was itself a prefix
+      test, so 015 agreed with it BY CONSTRUCTION and could not be judged by it.
+    * 017 makes an ACCENTED query accent-sensitive. The old yardstick folded
+      accents on both sides, so every deliberate exclusion read as recall loss -
+      it reported baon.hu on Ludovic Orban, the Romanian PM, as a miss for the
+      query "Orbán". A precision WIN, scored as a defect.
+
+    So the one loose set becomes three, by the weakest relation the article has
+    across ALL terms of the query:
+
+        exact   the term is a whole word, accents and all
+        accent  a whole word once accents are folded away
+        prefix  some word STARTS WITH the term
+
+    Only `exact` is a requirement. A document containing the literal words the
+    user typed must come back, whatever the engine does; everything looser is a
+    FEATURE of the engine, and a feature cannot be a failure. `accent` and
+    `prefix` are context - the first is what an accent-free query should reach,
+    the second what a term above corpus.prefix_min_length() should.
+
+    Terms split on whitespace AND hyphen. That is tokenisation, not
+    engine-mimicry: it is what makes "orosz" a whole word inside "orosz-ukrán"
+    while leaving it not-a-word inside "Oroszországgal" - the exact distinction
+    the old prefix test could not draw, and the source of one of its misses.
     """
-    if not term:
-        return False
-    start = haystack.find(term)
-    while start != -1:
-        if start == 0 or not (haystack[start - 1].isalnum()
-                              or haystack[start - 1] == "_"):
-            return True
-        start = haystack.find(term, start + 1)
-    return False
+    terms = [t for t in re.split(r"[\s\-]+", query) if t]
+    tiers = {"exact": set(), "accent": set(), "prefix": set()}
+    if not terms:
+        return tiers
+
+    rank = {"exact": 3, "accent": 2, "prefix": 1, "none": 0}
+    for aid, doc in corpus.items():
+        weakest = min(rank[_relation(doc, t)] for t in terms)
+        if weakest == 0:
+            continue
+        tiers["prefix"].add(aid)                    # every tier contains
+        if weakest >= 2:                            # everything stronger
+            tiers["accent"].add(aid)
+        if weakest == 3:
+            tiers["exact"].add(aid)
+    return tiers
+
+
+def _relation(doc: dict, term: str) -> str:
+    """How this article contains this term: exact, accent, prefix or none."""
+    low, folded = term.lower(), fold(term)
+    if low in doc["words_lower"]:
+        return "exact"
+    if folded in doc["words_folded"]:
+        return "accent"
+    if re.search(r"(?:^|\W)" + re.escape(folded), doc["text_folded"]):
+        return "prefix"
+    return "none"
 
 
 def lexemes_for(cur, word: str) -> str:
@@ -174,6 +214,26 @@ def explain_miss(cur, corpus: dict, article_id: int, query: str) -> dict:
     return {"word": "(not located)", "lexeme": "", "query_lexeme": lexemes_for(cur, query)}
 
 
+def _stem_only_words(corpus: dict, query: str, ids: set) -> list:
+    """The words that a stem-only hit actually contains, for the report.
+
+    An over-stem is only actionable if you can see what it matched. 'párt'
+    matching 48 articles is a number; 'párt' matching them through the word
+    'pár' is a diagnosis.
+    """
+    terms = [t for t in re.split(r"[\s\-]+", query) if t]
+    seen = {}
+    for aid in sorted(ids)[:40]:
+        doc = corpus[aid]
+        for term in terms:
+            head = fold(term)[:3]
+            for w in sorted(doc["words_lower"]):
+                if fold(w).startswith(head) and fold(w) != fold(term):
+                    seen[w] = seen.get(w, 0) + 1
+                    break
+    return sorted(seen.items(), key=lambda kv: -kv[1])[:6]
+
+
 def collect(cur, dict_cur) -> dict:
     corpus = corpus_index(dict_cur)
     report = {"queries": [], "tags": [], "corpus_size": len(corpus)}
@@ -193,7 +253,12 @@ def collect(cur, dict_cur) -> dict:
         parsed = dict_cur.fetchone()[0]
 
         returned = {r["id"] for r in rows}
-        substrings = substring_hits(corpus, query)
+        tiers = yardstick(corpus, query)
+        # RECALL is measured against the EXACT tier only. A document holding the
+        # literal words typed must come back; anything looser is a feature of
+        # the engine (015's prefix, 017's accent-blindness) and a feature cannot
+        # be a failure. See yardstick().
+        substrings = tiers["exact"]
 
         results = []
         for rank, hit in enumerate(rows, 1):
@@ -221,7 +286,7 @@ def collect(cur, dict_cur) -> dict:
                 "canonical": hit["canonical_url"] or hit["source_url"],
                 "status": hit["extraction_status"],
                 "blocks": blocks,
-                "in_substring": hit["id"] in substrings,
+                "in_substring": hit["id"] in tiers["prefix"],
             })
 
         misses = []
@@ -249,7 +314,16 @@ def collect(cur, dict_cur) -> dict:
             "latency_ms": round(latency, 2),
             "returned": len(returned), "returned_all": len(returned_all),
             "substring": len(substrings),
-            "stem_only": sorted(returned_all - substrings),
+            "tier_accent": len(tiers["accent"]),
+            "tier_prefix": len(tiers["prefix"]),
+            # PRECISION, which this report never had: articles the engine
+            # returns that contain no form of the term at all - not even as a
+            # prefix. That is an over-stemming detector, and on the current
+            # engine it finds párt -> pár (48) without anyone having to notice
+            # it by hand.
+            "stem_only": sorted(returned_all - tiers["prefix"]),
+            "stem_only_words": _stem_only_words(corpus, query,
+                                                returned_all - tiers["prefix"]),
             "results": results, "misses": misses,
         })
 
@@ -462,7 +536,7 @@ const href = h => LINKS ? `articles/${h.outlet}-${h.url_hash.slice(0,8)}.html` :
 function results(q){
   if(!q.results.length) return `<div class="nores">Postgres returned nothing for
     <code>${esc(q.query)}</code>.${q.substring
-      ? ` But ${q.substring} article(s) contain it as text — see below.`
+      ? ` But ${q.substring} article(s) contain the literal word(s) — see below.`
       : ' No article contains this text either, so the empty answer is correct.'}</div>`;
   const top = Math.max(...q.results.map(r => r.score)) || 1;
   return q.results.map(r => {
@@ -527,7 +601,7 @@ function comparison(q){
 function misses(q){
   if(!q.misses.length) return `<div class="misses good"><h3>No misses</h3>
     <p>Every article containing this text was returned. Recall is complete for this query.</p></div>`;
-  return `<div class="misses"><h3>${q.misses.length} article(s) contain the text but were NOT returned</h3>
+  return `<div class="misses"><h3>${q.misses.length} article(s) contain the literal word(s) but were NOT returned</h3>
     <p>Search compares lexemes, not strings. Each row shows the word actually in the
     article, the lexeme it produces, and the lexeme your query produced — when those two
     differ, the article cannot match.</p>
@@ -546,6 +620,11 @@ function misses(q){
 function show(i){
   const q = DATA.queries[i];
   document.querySelectorAll('.qbtn').forEach((b,j)=>b.setAttribute('aria-current', j===i));
+  // Recall is measured against the EXACT tier only - articles containing the
+  // literal words typed. The looser tiers are shown beside it as context, not
+  // scored: the engine reaching them is a feature (015 prefix, 017 accents),
+  // and a feature must not read as a defect. This number is NOT comparable to
+  // the one this report printed before 2026-09-04.
   const recall = q.substring ? Math.round(100*(q.substring-q.misses.length)/q.substring) : null;
   document.getElementById('panel').innerHTML = `
     <div class="qhead">
@@ -554,7 +633,12 @@ function show(i){
       <div class="facts">
         <div class="fact"><span class="k">parsed tsquery</span><span class="v">${esc(q.parsed)||'(empty)'}</span></div>
         <div class="fact ${q.returned?'ok':'bad'}"><span class="k">returned</span><span class="v">${q.returned}</span></div>
-        <div class="fact"><span class="k">contain the text</span><span class="v">${q.substring}</span></div>
+        <div class="fact"><span class="k">stem-only</span><span class="v">${q.stem_only.length}${
+            q.stem_only_words && q.stem_only_words.length
+              ? ' · ' + esc(q.stem_only_words.map(w => w[0]).slice(0,3).join(', ')) : ''}</span></div>
+        <div class="fact"><span class="k">also as prefix</span><span class="v">${q.tier_prefix}</span></div>
+        <div class="fact"><span class="k">ignoring accents</span><span class="v">${q.tier_accent}</span></div>
+        <div class="fact"><span class="k">contain the literal word</span><span class="v">${q.substring}</span></div>
         <div class="fact ${q.misses.length?'warn':'ok'}"><span class="k">recall</span><span class="v">${recall===null?'n/a':recall+'%'}</span></div>
         <div class="fact"><span class="k">latency</span><span class="v">${q.latency_ms} ms</span></div>
       </div>
