@@ -646,6 +646,17 @@ instead aggregates the best block scores. For a citation-oriented tool that is
 arguably the better ranking anyway — the best passage is what you want to show.
 If whole-document ranking turns out to matter, add it then, with a measurement.
 
+**Split paradigms, 2026-09-04 (018).** The stemmer over-strips some base forms
+and not their inflections — `párt` → `'pár'` but `pártja`/`pártok` → `'párt'` —
+so 017's accented branch, having only one alternative, stopped finding most of
+the paradigm. It now emits two, the accented lemma **or** the term as typed,
+mirroring the accent-free branch's `lemma | surface`. When the stemmer
+over-strips a base form, that base form is what its own inflections stem to, so
+the raw term recovers exactly the missing half. `párt` 131→159; `kór`, `ügy`,
+`kormány`, `Magyarország` unchanged, their lemma and raw forms being identical.
+Residue, unfixable without a dictionary: `párt` really is the accusative of
+`pár`.
+
 **Accent collisions, 2026-09-04 (016, 017).** `search_vector` originally
 unaccented *both* halves, so nothing stored preserved an accent and three
 distinct words became one lexeme — `kör`, `kór` and `kor` each returned the same
