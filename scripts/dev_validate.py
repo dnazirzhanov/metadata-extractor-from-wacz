@@ -444,15 +444,32 @@ def verify_search(cur, root: Path) -> dict:
             note(f"{query!r} does not occur anywhere in this sample - the zero "
                  f"result is the corpus, not the query")
 
-    # Accent folding: the accented and unaccented spellings must agree exactly.
+    # Accents. Until migration 017 these two spellings had to return the SAME
+    # articles - accent folding was total. 017 made an accented query
+    # accent-SENSITIVE, so the contract is now containment, not equality:
+    #
+    #     an accent-free query is accent-blind  ->  it must find everything
+    #     an accented query means that word     ->  it may find fewer
+    #
+    # Equality would now be a bug report against a deliberate feature, so the
+    # assertion tests the relation that still has to hold. It is not weaker: it
+    # would still catch unaccent silently dying, which would empty the plain
+    # side, and it additionally catches the accented side matching something the
+    # blind side does not - which would mean accent-sensitivity had invented
+    # documents rather than filtered them.
     head("SEARCH - accents and stemming")
     for accented, plain in (("Magyarország", "magyarorszag"), ("Orbán", "Orban")):
         run(accented), run(plain)          # latency + display only
         a, b = all_ids(accented), all_ids(plain)
-        print(f"   {accented!r:<16} {len(a):>3} hit(s)   {plain!r:<16} {len(b):>3} hit(s)")
+        extra = len(b - a)
+        print(f"   {accented!r:<16} {len(a):>3} hit(s)   {plain!r:<16} {len(b):>3} hit(s)"
+              f"   accent-free adds {extra}")
         if a:
-            check(a == b, f"{accented!r} and {plain!r} return different articles "
-                          f"({len(a)} vs {len(b)}) - unaccent is not doing its job")
+            check(a <= b, f"{accented!r} returns {len(a - b)} article(s) that "
+                          f"{plain!r} does not - an accented query must be a "
+                          f"SUBSET of the accent-blind one (017)")
+            check(len(b) > 0, f"{plain!r} returns nothing - unaccent is not "
+                              f"doing its job")
             report["present"][plain] = len(b)
 
     # Stemming: an inflected form must find what the base form finds.

@@ -646,6 +646,17 @@ instead aggregates the best block scores. For a citation-oriented tool that is
 arguably the better ranking anyway — the best passage is what you want to show.
 If whole-document ranking turns out to matter, add it then, with a measurement.
 
+**Accent collisions, 2026-09-04 (016, 017).** `search_vector` originally
+unaccented *both* halves, so nothing stored preserved an accent and three
+distinct words became one lexeme — `kör`, `kór` and `kor` each returned the same
+166 articles; corpus-wide, 639 collision groups over 4,302 word forms. 016 adds a
+third, accent-preserving component (`to_tsvector('corpus.hungarian_lemma', t)`,
+the vector `phrase_match` already built per row) and rebuilds the three generated
+columns; 017 makes a query that *carries* an accent match it. A query without one
+stays accent-blind, which is what D.2's `hungarian_surface` half exists for.
+Measured: `kór` 166→10, `ügy` 380→119, `Magyarország`/`Orbánnak`/`háború`
+unchanged, `Orbán` −1. Index cost +0.6% on `content_block`.
+
 **Correction, 2026-09-04 — that paragraph named the wrong cost.** Whole-document
 ranking was not the only thing the semi-join gave up. The predicate hands the
 *whole* tsquery to one vector, so every term of a multi-word AND had to land in

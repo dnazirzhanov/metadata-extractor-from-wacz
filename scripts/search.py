@@ -150,7 +150,10 @@ META_HIT = (
 #: therefore matches nothing, which is what corpus.search_query already answered.
 CANDIDATES = """
         q AS (SELECT corpus.search_query(%(query)s) AS tsq,
-                     corpus.search_terms(%(query)s) AS terms),
+                     corpus.search_terms(%(query)s) AS terms,
+                     -- the term STRINGS, for corpus.accented_query() in ranking
+                     regexp_split_to_array(
+                         corpus.collapse_whitespace(%(query)s), '[ -]+') AS raw_terms),
         doc AS (
             SELECT m.article_id
             FROM q,
@@ -343,7 +346,8 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                    AND (NOT %(phrase)s
                         OR {PHRASE}(concat_ws(' ', i.caption, i.alt),
                                     %(query)s)))               AS caption_rank,
-               tr.term_rank
+               tr.term_rank,
+               ar.accent_rank
         FROM corpus.article a
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
@@ -365,8 +369,25 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                                     AND i.caption_tsv @@ t.tsq), 0)), 0) AS term_rank
             FROM unnest(q.terms) AS t(tsq)
         ) tr
+        CROSS JOIN LATERAL (
+            -- ACCENT BONUS. Rewards a document whose accents match the query's,
+            -- which is the only thing that separates Viktor from Viktória -
+            -- both fold to 'viktor', and only their ACCENT-PRESERVING lemmas
+            -- ('viktor' vs 'viktór') differ. Matching cannot use that: an
+            -- accent-free query is accent-blind by design (007), and all three
+            -- components share one tsvector so a lexeme cannot be attributed to
+            -- the one it came from. Ranking can, by rebuilding the accented
+            -- vector for the metadata - which is where names live - and asking
+            -- corpus.accented_query() (017).
+            SELECT coalesce(sum(
+                       ts_rank(to_tsvector('corpus.hungarian_lemma',
+                                   concat_ws(' ', a.title, a.subtitle, a.description)),
+                               corpus.accented_query(t.term))), 0) AS accent_rank
+            FROM unnest(q.raw_terms) AS t(term)
+        ) ar
         WHERE {MATCH_WHERE}
         ORDER BY (tr.term_rank
+                  + ar.accent_rank
                   -- CONCENTRATION BONUS: the whole query satisfied by ONE
                   -- vector, which is exactly the old score, kept whole and now
                   -- added on top of the base rather than being the whole story.
@@ -410,7 +431,8 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
         # base + concentration bonus, matching the ORDER BY exactly. Keeping the
         # two visible separately is the point: term_rank says the terms are
         # there, the bonus says they are there TOGETHER.
-        hit["score"] = (hit["term_rank"] + hit["meta_rank"]
+        hit["accent_rank"] = float(hit["accent_rank"] or 0.0)
+        hit["score"] = (hit["term_rank"] + hit["accent_rank"] + hit["meta_rank"]
                         + hit["body_rank"] + hit["caption_rank"])
         hit["match_reason"] = (
             "both" if hit["meta_match"] and hit["body_rank"]
