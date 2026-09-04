@@ -653,9 +653,10 @@ the **same block**. An article whose terms are spread over its body matched
 nothing:
 
     'orosz-ukrán háború', article #158  ->  metadata 0 blocks 0   (dropped)
-        term 'orosz'    blocks [4, 9, 10]
-        term 'ukrán'    blocks [4]
-        term 'háború'   metadata + blocks [1, 5, 6, 14]
+        term 1  orosz-ukrán    metadata no,   blocks [4, 9, 10]
+        term 2  háború         metadata yes,  blocks [1, 5, 6, 14]
+
+(Terms split on whitespace only, so the hyphenated compound stays one term.)
 
 That is a **recall** cost, and it was the larger one: 12 of the 13 standing
 recall misses, and `ukrajnai fejlesztés` returning 4 of the 11 articles that

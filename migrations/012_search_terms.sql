@@ -18,13 +18,16 @@
 -- Measured on the 1,008-article evaluation corpus, article #158:
 --
 --     'orosz-ukrán háború'  ->  whole query: metadata 0, blocks 0   (dropped)
---        term 'orosz'    blocks [4, 9, 10]
---        term 'ukrán'    blocks [4]
---        term 'háború'   metadata + blocks [1, 5, 6, 14]
+--        term 1  orosz-ukrán    metadata no,   blocks [4, 9, 10]
+--        term 2  háború         metadata yes,  blocks [1, 5, 6, 14]
 --
--- Block 4 holds orosz and ukrán but not háború; the metadata holds háború and
--- neither of the others. No single vector holds all three, so the article is
--- not returned. This is 12 of the 13 standing recall misses. On the probe set:
+-- The article contains both terms. No single vector contains both: the blocks
+-- carrying term 1 do not carry term 2, and the metadata carries only term 2.
+-- So the article is not returned.
+--
+-- Terms split on whitespace ONLY, so the hyphenated compound stays ONE term -
+-- its own alternation already covers orosz and ukrán. Read the split off
+-- corpus.search_terms() rather than assuming it; a word is not a term. This is 12 of the 13 standing recall misses. On the probe set:
 --
 --     query                  shipped  document-level  misses -> misses
 --     orosz-ukrán háború          41              56       4 -> 0
