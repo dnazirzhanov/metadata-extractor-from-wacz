@@ -24,10 +24,30 @@ was the larger one: handing the whole tsquery to one vector required every term
 of a multi-word AND to land in the same paragraph, so 'ukrajnai fejlesztés'
 returned 4 of the 11 articles that contain both words. Since 012 the terms are
 addressable separately (corpus.search_terms) and an article matches when every
-term appears SOMEWHERE in it - see CANDIDATES below. Ranking is unchanged and
-still needs the whole query in one vector, so an article matched across vectors
-scores 0 and sorts last. That is the right order - its terms are scattered, so
-it is a weaker match - but it means the ranking caveat above is still open.
+term appears SOMEWHERE in it - see CANDIDATES below.
+
+Ranking follows from that. ts_rank scores a vector against a query, and returns
+zero when the vector does not satisfy the whole query - so every article the 012
+fix recovered scored zero and sorted last. The score is now
+
+    term_rank   sum over TERMS of what each term is worth, wherever it sits
+  + meta_rank   \
+  + body_rank    >  the whole query satisfied by ONE vector - the old score,
+  + caption_rank/   kept whole, now read as a CONCENTRATION BONUS
+
+The base is always positive for anything that matched, so a document-level hit
+is scored on its body rather than on nothing. Before this, body_rank and
+caption_rank were guarded by `@@ q.tsq` and so were structurally zero for such
+an article - its entire body contributed nothing, and the only surviving signal
+was whatever partial credit ts_rank gave the metadata (ts_rank does not require
+the query to match, which is why the score was not always literally zero).
+
+The bonus weights concentration; it does not tier it. A heavily scattered
+article can outrank a weakly concentrated one, and should.
+
+For a SINGLE-TERM query the base is identically the old score, so the total is
+exactly twice it and the order is unchanged - which is the property to check
+first when touching any of this.
 
 Filters (--author, --section, --from/--to) are EXACT and are applied as
 predicates, never as full-text. --phrase is different in kind: it is a recheck
@@ -314,12 +334,42 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                    AND i.caption_tsv @@ q.tsq
                    AND (NOT %(phrase)s
                         OR {PHRASE}(concat_ws(' ', i.caption, i.alt),
-                                    %(query)s)))               AS caption_rank
+                                    %(query)s)))               AS caption_rank,
+               tr.term_rank
         FROM corpus.article a
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
+        CROSS JOIN LATERAL (
+            -- The BASE score: what each term is worth wherever it sits. Summed
+            -- over terms, so an article scores even when no single vector holds
+            -- the whole query - which is every article the 012 fix recovered.
+            SELECT coalesce(sum(
+                       ts_rank(a.search_tsv, t.tsq)
+                     + coalesce((SELECT max(ts_rank(b.text_tsv, t.tsq))
+                                   FROM corpus.content_block b
+                                  WHERE b.article_id = a.id
+                                    AND b.extraction_id = a.current_extraction_id
+                                    AND b.text_tsv @@ t.tsq), 0)
+                     + coalesce((SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                                   FROM corpus.article_image i
+                                  WHERE i.article_id = a.id
+                                    AND i.extraction_id = a.current_extraction_id
+                                    AND i.caption_tsv @@ t.tsq), 0)), 0) AS term_rank
+            FROM unnest(q.terms) AS t(tsq)
+        ) tr
         WHERE {MATCH_WHERE}
-        ORDER BY (ts_rank(a.search_tsv, q.tsq)
+        ORDER BY (tr.term_rank
+                  -- CONCENTRATION BONUS: the whole query satisfied by ONE
+                  -- vector, which is exactly the old score, kept whole and now
+                  -- added on top of the base rather than being the whole story.
+                  -- It WEIGHTS concentration, it does not tier it: a heavily
+                  -- scattered article can still outrank a weakly concentrated
+                  -- one, and should - repeated mentions throughout a piece are
+                  -- better evidence than one thin co-occurrence in a sentence.
+                  -- Measured on 'ukrajnai fejlesztés': concentrated hits score
+                  -- 0.163-1.886, document-level hits 0.091-0.469, and they
+                  -- interleave.
+                  + ts_rank(a.search_tsv, q.tsq)
                   + coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
                                 FROM corpus.content_block b
                                WHERE b.article_id = a.id
@@ -330,7 +380,12 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                                WHERE i.article_id = a.id
                                  AND i.extraction_id = a.current_extraction_id
                                  AND i.caption_tsv @@ q.tsq), 0)) DESC,
-                 a.published_at DESC NULLS LAST
+                 a.published_at DESC NULLS LAST,
+                 -- Deterministic last resort. 'Magyarország' puts 82 articles
+                 -- on one score and 63 on another, so without this the tail of
+                 -- a result list is in unspecified order and a harness that
+                 -- diffs two runs reports changes that are not changes.
+                 a.id
         LIMIT %(limit)s
     """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit,
           "author": author, "section": section, "phrase": phrase,
@@ -343,7 +398,12 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
         hit["meta_rank"] = float(hit["meta_rank"] or 0.0)
         hit["caption_rank"] = float(hit["caption_rank"] or 0.0)
         hit["caption_match"] = hit["caption_rank"] > 0
-        hit["score"] = hit["meta_rank"] + hit["body_rank"] + hit["caption_rank"]
+        hit["term_rank"] = float(hit["term_rank"] or 0.0)
+        # base + concentration bonus, matching the ORDER BY exactly. Keeping the
+        # two visible separately is the point: term_rank says the terms are
+        # there, the bonus says they are there TOGETHER.
+        hit["score"] = (hit["term_rank"] + hit["meta_rank"]
+                        + hit["body_rank"] + hit["caption_rank"])
         hit["match_reason"] = (
             "both" if hit["meta_match"] and hit["body_rank"]
             else "metadata" if hit["meta_match"]
