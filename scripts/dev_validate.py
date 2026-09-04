@@ -87,6 +87,18 @@ EXPECTED_TABLES = {
 }
 
 
+def _starts_word(haystack: str, term: str) -> bool:
+    """True when `term` begins a word in `haystack`. Both already accent-folded."""
+    if not term:
+        return False
+    at = haystack.find(term)
+    while at != -1:
+        if at == 0 or not (haystack[at - 1].isalnum() or haystack[at - 1] == "_"):
+            return True
+        at = haystack.find(term, at + 1)
+    return False
+
+
 def verify_schema(cur, repo: Path) -> None:
     head("SCHEMA")
     cur.execute("SELECT count(*) FROM information_schema.schemata WHERE schema_name='corpus'")
@@ -376,10 +388,25 @@ def verify_search(cur, root: Path) -> dict:
     report: dict = {"present": {}, "absent": {}, "latency_ms": {}}
 
     def run(query: str, **kwargs) -> list[dict]:
+        """The RANKED list a user would see. Truncated, and only ever used for
+        display, latency and 'did anything come back'."""
         started = time.monotonic()
         rows = search_layer.search_articles(cur, query, limit=25, **kwargs)
         report["latency_ms"][query] = (time.monotonic() - started) * 1000
         return rows
+
+    def all_ids(query: str, **kwargs) -> set[int]:
+        """The COMPLETE match set, for every assertion that compares two
+        queries to each other.
+
+        A set comparison against a rank-truncated list measures the LIMIT, not
+        the search. With 36 articles the limit above never bound and the two
+        were interchangeable; at 1,008 every broad query saturates it, and this
+        harness reported four failures - accent folding "broken", two stemming
+        subsets "violated", tag-filter and full-text "indistinguishable" - all
+        of which were 25 == 25 and none of which were real.
+        """
+        return search_layer.matching_ids(cur, query, **kwargs)
 
     requested = ["Orbán Viktor", "Donald Trump", "Magyarország", "orosz-ukrán háború"]
     for query in requested:
@@ -387,17 +414,23 @@ def verify_search(cur, root: Path) -> dict:
         # Is the term genuinely in the corpus? Decided from the DATA, so a zero
         # result is attributed to the sample and never to a broken query.
         needles = [fold(w) for w in query.replace("-", " ").split()]
+        # Word-INITIAL, not "anywhere in the string". -ban/-ben is the inessive
+        # case ending, so a bare substring test finds "Orban" inside elsosorban,
+        # musorban, szektorban and taborban, and then blames the search engine
+        # for not returning them.
         in_corpus = sum(
             1 for doc in corpus.values()
-            if all(n in fold(" ".join([doc["title"], doc["subtitle"], doc["description"],
-                                       doc["body"], " ".join(doc["tags"])]))
+            if all(_starts_word(fold(" ".join([doc["title"], doc["subtitle"],
+                                               doc["description"], doc["body"],
+                                               " ".join(doc["tags"])])), n)
                    for n in needles))
-        print(f"   {query!r:<24} {len(rows):>3} hit(s)   "
-              f"({in_corpus} article(s) contain every term as a substring)")
-        if in_corpus > len(rows) > 0:
-            note(f"{query!r}: {in_corpus} article(s) contain the string but only "
-                 f"{len(rows)} match - a substring is not a lexeme; see the "
-                 f"stemmer diagnostics")
+        found = len(all_ids(query))
+        print(f"   {query!r:<24} {found:>3} hit(s)   "
+              f"({in_corpus} article(s) start a word with every term)")
+        if in_corpus > found > 0:
+            note(f"{query!r}: {in_corpus} article(s) contain the term but only "
+                 f"{found} match - a word is not a lexeme; see the stemmer "
+                 f"diagnostics")
         if in_corpus:
             check(len(rows) > 0,
                   f"search for {query!r} found nothing although {in_corpus} "
@@ -414,8 +447,8 @@ def verify_search(cur, root: Path) -> dict:
     # Accent folding: the accented and unaccented spellings must agree exactly.
     head("SEARCH - accents and stemming")
     for accented, plain in (("Magyarország", "magyarorszag"), ("Orbán", "Orban")):
-        a = {r["id"] for r in run(accented)}
-        b = {r["id"] for r in run(plain)}
+        run(accented), run(plain)          # latency + display only
+        a, b = all_ids(accented), all_ids(plain)
         print(f"   {accented!r:<16} {len(a):>3} hit(s)   {plain!r:<16} {len(b):>3} hit(s)")
         if a:
             check(a == b, f"{accented!r} and {plain!r} return different articles "
@@ -426,8 +459,8 @@ def verify_search(cur, root: Path) -> dict:
     report["stemming"] = {}
     for inflected, base in (("Magyarországra", "Magyarország"),
                             ("Orbánnak", "Orbán"), ("Orbánt", "Orbán")):
-        a = {r["id"] for r in run(inflected)}
-        b = {r["id"] for r in run(base)}
+        run(inflected), run(base)          # latency + display only
+        a, b = all_ids(inflected), all_ids(base)
         print(f"   {inflected!r:<16} {len(a):>3} hit(s)   vs base {base!r} {len(b):>3}")
         if not b:
             continue
@@ -472,8 +505,9 @@ def verify_search(cur, root: Path) -> dict:
              "filter-vs-full-text distinction cannot be shown on this sample")
     else:
         tag, tagged_count, fts_count = picked
-        filtered = search_layer.filter_by_tag(cur, tag)
-        fts = run(tag)
+        filtered = search_layer.filter_by_tag(cur, tag, limit=100000)
+        run(tag)                           # latency + display only
+        fts = all_ids(tag)
         print(f"   tag {tag!r}: exact filter {len(filtered)}, full-text {len(fts)} "
               f"(expected {tagged_count} / {fts_count})")
         check(len(filtered) == tagged_count,

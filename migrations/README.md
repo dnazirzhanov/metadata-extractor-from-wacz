@@ -10,6 +10,8 @@ Plain, idempotent SQL. Design and rationale: [../docs/postgres-schema.md](../doc
 | `004_artifacts.sql` | `article_artifact` |
 | `005_passage_reference.sql` | `passage_reference`, `corpus.passage_selector` view |
 | `006_indexes.sql` | 24 indexes — 15 query, 9 FK-maintenance |
+| `007_search_recall.sql` | `hungarian_lemma` + `hungarian_surface` configs, `unaccent_immutable`, `search_vector`, `search_query`; rebuilds both search vectors |
+| `008_caption_search.sql` | `article_image.caption_tsv` — image captions, alt text and credits become searchable (discoverable, not citable) |
 
 ## What these do and do not touch
 
@@ -75,11 +77,36 @@ scripts/validate_ingestion.sh <dir>     # ingest real output, assert invariants
 the extractor's guarantees still hold once the data is in Postgres, then ingests
 everything again to exercise re-extraction. Last run: **907 checks, all passing.**
 
-## If you change the search configuration
+## If you change how search works
 
-`corpus.hungarian_ci` is referenced **by name** from `STORED` generated tsvector
-columns. A stored generated column is not recomputed when the configuration
-changes, so `ALTER TEXT SEARCH CONFIGURATION` after data exists silently
-desynchronises every vector from its own text. Changing it means: drop the
-generated columns, alter the config, re-add the columns, rebuild the GIN
-indexes. That is a migration, not a tweak.
+Since `007` the vectors are built by **`corpus.search_vector()`**, which reads
+`corpus.hungarian_lemma` and `corpus.hungarian_surface`. All three are
+referenced **by name** from `STORED` generated tsvector columns, and a stored
+generated column is not recomputed when the thing it names changes — so
+`CREATE OR REPLACE FUNCTION` or `ALTER TEXT SEARCH CONFIGURATION` after data
+exists silently desynchronises every vector from its own text. Changing any of
+them means: drop the generated columns, change the thing, re-add the columns,
+rebuild the GIN indexes. That is a migration, not a tweak.
+
+`corpus.search_query()` is the query-side half of the same transformation and
+must always be changed with `corpus.search_vector()`. It is not referenced from
+any stored column, so replacing it alone is safe — and immediately wrong, since
+queries would stop matching the vectors.
+
+`corpus.hungarian_ci` survives `007` unreferenced, kept only so that
+application code still naming it in a `ts_headline()` call does not fail. Drop
+it once nothing does.
+
+### Why 007 exists
+
+`hungarian_ci` put `unaccent` in FRONT of the snowball stemmer, so the stemmer
+was fed text that is no longer Hungarian and stripped whatever the accent-free
+spelling made look like a suffix — `Orbán` became `or`, colliding with `orra`
+("nose"), while `Orbánnak` became `orban` and matched neither. Measured on the
+36-article dev corpus, `Magyarországról` returned 2 articles of 20 and
+`Orbánnak` returned none at all.
+
+`007` indexes two lexemes per word instead — the accent-folded lemma and the
+accent-folded surface form — and expands queries into the matching per-term
+alternation. `scripts/stemming_lab.py` scores the candidates that were
+considered; the numbers are in the header of the migration.

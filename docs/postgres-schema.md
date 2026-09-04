@@ -494,16 +494,69 @@ ALTER  TEXT SEARCH CONFIGURATION hungarian_ci
   ALTER MAPPING FOR hword, hword_part, word WITH unaccent, hungarian_stem;
 ```
 
-`hungarian_ci` is the config every vector below uses. It must be created **before**
+> **Superseded by migration 007.** The reasoning above is sound about the
+> problem and wrong about the fix — see D.1.2. `hungarian_ci` still exists but
+> no vector uses it. The rest of this section (immutability, the config being
+> part of the schema contract, a change being a migration rather than a tweak)
+> applies unchanged to what replaced it.
+
+`hungarian_ci` was the config every vector used. It must be created **before**
 any generated column references it, and it must never be altered afterwards — a
 stored `tsvector` is not recomputed by an `ALTER CONFIGURATION`, so changing it
 silently desynchronizes the index from the data. Changing it later means a
 rewrite of both vectors, which is a migration, not a tweak.
 
 One caveat to state plainly: a stored generated column requires the config to be
-`IMMUTABLE`-referenced by name, which Postgres permits, but it also means
-`hungarian_ci` becomes part of the schema's contract. That is the right trade for
+`IMMUTABLE`-referenced by name, which Postgres permits, but it also means the
+config becomes part of the schema's contract. That is the right trade for
 correct Hungarian search.
+
+### D.1.2 Why `unaccent → hungarian_stem` was the wrong order
+
+Putting `unaccent` in front of the stemmer hands the stemmer text that is **no
+longer Hungarian**. Snowball then strips whatever the accent-free spelling makes
+look like a suffix:
+
+| word | `hungarian_ci` lexeme | |
+| --- | --- | --- |
+| `Orbán` | `or` | `-ban` read as the inessive case |
+| `orra` ("nose") | `or` | …so the two collide |
+| `Orbánnak` | `orban` | …and matches neither |
+| `Magyarország` | `magyarorszag` | |
+| `Magyarországról` | `magyarorszagrol` | the pair never unifies |
+
+The damage is not uniform — `kormány`/`kormányban` unify correctly while
+`Orbán`/`Orbánnak` do not — so the behaviour cannot be predicted from the query,
+which is the worst property a search system can have. On the 36-article dev
+corpus `Magyarországról` returned 2 articles of 20 and `Orbánnak` returned none.
+
+Accent-insensitivity and stemming are two jobs, and one lexeme per word cannot
+do both. **007 indexes two**, unioned into the same vector:
+
+| | built from | `kormányban` → |
+| --- | --- | --- |
+| lemma | stem the accented text, *then* fold accents off the lemma | `kormany` |
+| surface | fold accents off the word, no stemming | `kormanyban` |
+
+A query is expanded the same way and alternated per term — `kormányban` becomes
+`('kormany' | 'kormanyban')` — so the lemma side carries inflection, the surface
+side carries accent-free spelling, and neither can be broken by the other's
+failure mode. `corpus.search_vector()` builds the vector, `corpus.search_query()`
+builds the query, and the two must always change together.
+
+Measured over 19 probe queries against an accent-folded substring yardstick
+computed in Python (`scripts/stemming_lab.py`, so no configuration can score
+well by agreeing with itself): recall **70.2% → 93.1%**, precision
+**93.4% → 95.2%**, both GIN indexes roughly doubling. Six other candidates were
+scored, including two built on hunspell `hu_HU`; they are tabulated in the
+header of `migrations/007_search_recall.sql`. The two hunspell options were
+rejected for needing dictionary files in `$SHAREDIR/tsearch_data` inside the db
+container on milab2, surviving every rebuild, to buy 1.2 points of recall and
+lose 4.2 of precision.
+
+The cost is real: two lexemes per word, and rebuilding the generated columns
+rewrites every row of both tables — ~58M blocks and ~11.7 GB of text in
+production. This is a maintenance-window migration, not an online one.
 
 ### D.1.1 A generated column needs strict immutability
 
@@ -531,16 +584,16 @@ past the planner, and it must not be widened to `anyarray`. The two-argument
 only STABLE and cannot be used in a generated column at all, which is why the
 config is spelled out everywhere.
 
-### D.2 Two vectors, and why not three
+### D.2 Three vectors, and why not four
 
 **`article.search_tsv`** — for *finding articles*:
 
 ```sql
-setweight(to_tsvector('hungarian_ci', coalesce(title,'')),                   'A') ||
-setweight(to_tsvector('hungarian_ci', coalesce(subtitle,'')),                'B') ||
-setweight(to_tsvector('hungarian_ci', coalesce(description,'')),             'B') ||
-setweight(to_tsvector('hungarian_ci', array_to_string(authors,' ')),         'C') ||
-setweight(to_tsvector('hungarian_ci', array_to_string(tags,' ')),            'C')
+setweight(corpus.search_vector(coalesce(title,'')),                          'A') ||
+setweight(corpus.search_vector(coalesce(subtitle,'')),                       'B') ||
+setweight(corpus.search_vector(coalesce(description,'')),                    'B') ||
+setweight(corpus.search_vector(corpus.text_array_to_string(authors)),        'C') ||
+setweight(corpus.search_vector(corpus.text_array_to_string(tags)),           'C')
 ```
 
 Weights are the point: a title hit must outrank a tag hit. This also gives fuzzy
@@ -549,10 +602,34 @@ author and tag search for free, which is why there is no separate author index.
 **`content_block.text_tsv`** — for *finding and citing passages*:
 
 ```sql
-to_tsvector('hungarian_ci', coalesce(text,''))
+corpus.search_vector(coalesce(text,''))
 ```
 
-**There is deliberately no third vector over the whole article body.**
+**`article_image.caption_tsv`** — for *finding pictures by what they show*
+(migration 008):
+
+```sql
+corpus.search_vector(coalesce(caption,'') || ' ' || coalesce(alt,'')
+                                          || ' ' || coalesce(credit,''))
+```
+
+`block_text` is NULL for image and video blocks by design — an image block
+points at a row, it does not carry prose — so before 008 those blocks held an
+empty vector and 15% of all blocks could never match anything, with every image
+caption invisible to search. Caption text could not join `article.search_tsv`
+because a `STORED` generated column may only reference its own row, and it must
+not join `block_text` because the citation chain rests on
+`block_text = normalize_text(element)` and a caption lives in a `<figcaption>`
+that is not the block's element. So it gets its own vector, reached by the same
+semi-join as the body.
+
+It is **discoverable but not citable**: there is no selector for a caption, so a
+caption match tells you which article and which image and stops there. Measured
+over 277 query variants, that is 80 hits that now come back and cannot be
+pointed at — a deliberate trade, and the reason `search_articles` reports
+`match_reason = 'caption'` so a caller can tell the two apart.
+
+**There is deliberately no fourth vector over the whole article body.**
 `search_articles(query)` matching body text is served by a semi-join:
 
 ```sql
@@ -568,6 +645,39 @@ document ranking (`ts_rank` over the full body) is not available, and ranking
 instead aggregates the best block scores. For a citation-oriented tool that is
 arguably the better ranking anyway — the best passage is what you want to show.
 If whole-document ranking turns out to matter, add it then, with a measurement.
+
+**Correction, 2026-09-04 — that paragraph named the wrong cost.** Whole-document
+ranking was not the only thing the semi-join gave up. The predicate hands the
+*whole* tsquery to one vector, so every term of a multi-word AND had to land in
+the **same block**. An article whose terms are spread over its body matched
+nothing:
+
+    'orosz-ukrán háború', article #158  ->  metadata 0 blocks 0   (dropped)
+        term 1  orosz-ukrán    metadata no,   blocks [4, 9, 10]
+        term 2  háború         metadata yes,  blocks [1, 5, 6, 14]
+
+(Terms split on whitespace only, so the hyphenated compound stays one term.)
+
+That is a **recall** cost, and it was the larger one: 12 of the 13 standing
+recall misses, and `ukrajnai fejlesztés` returning 4 of the 11 articles that
+contain both words. The queries that survived were the ones whose terms are
+*adjacent* — `Orbán Viktor`, `Donald Trump` — because those land in one title,
+which is why name lookups looked healthy while topical search did not.
+
+**Fixed in 012 without adding the body vector.** `corpus.search_terms()` exposes
+the per-term tsqueries that `corpus.search_query()` was already ANDing, and
+`scripts/search.py` intersects them across vectors: each term is resolved by its
+own index-served UNION over the three GINs, and the terms are intersected by
+counting distinct ordinals. Measured on the evaluation corpus, recall misses
+went **13 → 1** (the survivor is `nyomásgyakorlás`, a compound the stemmer does
+not split), single-word results are byte-identical, and `EXPLAIN` shows no
+sequential scan on `article` or `content_block`.
+
+So the storage argument above still stands — the body vector is still not
+needed — but "the trade-off worth naming" was named incompletely for three days,
+and the search layer shipped on it. **Ranking is still the open half:** an
+article matched across vectors scores 0 and sorts last, because `ts_rank` needs
+the whole query in one vector.
 
 ### D.3 Indexes, one query each
 
@@ -899,6 +1009,8 @@ The crawler must not be touched. Four properties make that true by construction:
 `scripts/migrate.sh` or plain `psql -f`:
 
 ```
+007_search_recall.sql       hungarian_lemma + hungarian_surface configs,
+                            search_vector, search_query; rebuilds both vectors
 001_corpus_schema.sql       schema, ledger, unaccent, corpus.hungarian_ci,
                             the immutable array helper (§D.1.1)
 002_article.sql             article + article_extraction (the spine)
