@@ -675,9 +675,29 @@ sequential scan on `article` or `content_block`.
 
 So the storage argument above still stands — the body vector is still not
 needed — but "the trade-off worth naming" was named incompletely for three days,
-and the search layer shipped on it. **Ranking is still the open half:** an
-article matched across vectors scores 0 and sorts last, because `ts_rank` needs
-the whole query in one vector.
+and the search layer shipped on it.
+
+**Ranking followed, same day.** `ts_rank` scores a vector against a query, and
+`body_rank`/`caption_rank` are guarded by `@@ q.tsq`, so for an article matched
+across vectors both were structurally zero — its whole body contributed nothing
+to the score. The score is now a per-term base plus the old score as a
+concentration bonus:
+
+    term_rank      sum over TERMS of what each term is worth, wherever it sits
+  + meta_rank    \
+  + body_rank     >  the whole query in ONE vector — the old score, kept whole
+  + caption_rank /
+
+Anything that matched is scored on its text; terms sitting together still carry
+extra weight, but as a **weight, not a tier** — on `ukrajnai fejlesztés`
+concentrated hits score 0.163–1.886 and document-level hits 0.091–0.469, and
+they interleave, which is right: repeated mentions throughout a piece are better
+evidence than one thin co-occurrence in a sentence.
+
+For a single-term query the base is identically the old score, so the total is
+exactly twice it and the order cannot change — verified, max absolute difference
+0 over 100 rows. Whole-document `ts_rank` is still unavailable, and still not
+needed for this.
 
 ### D.3 Indexes, one query each
 
