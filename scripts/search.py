@@ -19,6 +19,16 @@ that choice is that whole-document ts_rank is unavailable, so the article score
 combines the metadata rank with the best matching block's rank - for a citation
 tool the best passage is what you want to surface anyway.
 
+That design note named only the ranking cost. It had a RECALL cost too, and it
+was the larger one: handing the whole tsquery to one vector required every term
+of a multi-word AND to land in the same paragraph, so 'ukrajnai fejlesztés'
+returned 4 of the 11 articles that contain both words. Since 012 the terms are
+addressable separately (corpus.search_terms) and an article matches when every
+term appears SOMEWHERE in it - see CANDIDATES below. Ranking is unchanged and
+still needs the whole query in one vector, so an article matched across vectors
+scores 0 and sorts last. That is the right order - its terms are scattered, so
+it is a weaker match - but it means the ranking caveat above is still open.
+
 Filters (--author, --section, --from/--to) are EXACT and are applied as
 predicates, never as full-text. --phrase is different in kind: it is a recheck
 over the same candidate set the index already produced, because the stored
@@ -67,8 +77,11 @@ HEADLINE_CONFIG = "corpus.hungarian_surface"
 #: in the text. Both are explained at length in migrations/009_search_filters.sql.
 PHRASE = "corpus.phrase_match"
 
-#: An article's METADATA hit. Under --phrase the prose fields are rechecked as
-#: one string, and each tag and each author is rechecked SEPARATELY.
+#: An article's METADATA hit. Since 012 this no longer GATES matching - the
+#: candidate set does - it only labels why a result came back, feeding
+#: `meta_match` and `match_reason`. Under --phrase the prose fields are
+#: rechecked as one string, and each tag and each author is rechecked
+#: SEPARATELY.
 #:
 #: Testing the arrays element by element rather than joined is the whole point.
 #: Joining them would let a phrase straddle two independent tags - an adjacency
@@ -84,25 +97,92 @@ META_HIT = (
     " OR EXISTS (SELECT 1 FROM unnest(a.authors) AS au"
     "             WHERE " + PHRASE + "(au, %(query)s))))")
 
-#: The match predicate itself, shared by search_articles() and matching_ids().
-#: Two copies of a WHERE clause is how a ranked result list and the recall set
-#: measured against it quietly stop meaning the same thing - the same argument
-#: that put the ingestion INSERTs in one module (scripts/cx_ingest.py).
-#: Expects a CTE `q` holding the tsquery, and the same parameter names.
-MATCH_WHERE = ("(" + META_HIT + """
+#: The candidate set: articles where EVERY query term appears SOMEWHERE in the
+#: article - metadata, any block, or any image caption - rather than where the
+#: whole query appears in ONE of those.
+#:
+#: This is the fix for the defect that produced 12 of the 13 standing recall
+#: misses (migrations/012). Handing the whole tsquery to one vector forces every
+#: term of a multi-word AND into the same paragraph, so an article that plainly
+#: contains all of them, spread over its body, matched nothing. Measured on the
+#: evaluation corpus: 'ukrajnai fejlesztés' returned 4 of 11 true matches.
+#:
+#: Shape matters as much as semantics. Each term is resolved by its OWN
+#: index-served UNION - GIN on article.search_tsv, on content_block.text_tsv,
+#: on article_image.caption_tsv - and the terms are intersected by counting
+#: distinct ordinals. A correlated NOT EXISTS over the terms would express the
+#: same set and force a sequential scan of corpus.article, which is the
+#: difference between a query that works at 4.2M articles and one that does not.
+#:
+#: A single-term query reduces to exactly the old union, so one-word search is
+#: unchanged - confirmed on the probe set, where only the three multi-word
+#: queries moved.
+#:
+#: Zero terms (an empty query, or one that is all stopwords) yields no rows and
+#: therefore matches nothing, which is what corpus.search_query already answered.
+CANDIDATES = """
+        q AS (SELECT corpus.search_query(%(query)s) AS tsq,
+                     corpus.search_terms(%(query)s) AS terms),
+        doc AS (
+            SELECT m.article_id
+            FROM q,
+                 unnest(q.terms) WITH ORDINALITY AS t(tsq, ord),
+                 LATERAL (
+                     SELECT a2.id AS article_id
+                       FROM corpus.article a2
+                      WHERE a2.search_tsv @@ t.tsq
+                     UNION
+                     SELECT b.article_id
+                       FROM corpus.content_block b
+                       JOIN corpus.article a3 ON a3.id = b.article_id
+                      WHERE b.extraction_id = a3.current_extraction_id
+                        AND b.text_tsv @@ t.tsq
+                     UNION
+                     SELECT i.article_id
+                       FROM corpus.article_image i
+                       JOIN corpus.article a4 ON a4.id = i.article_id
+                      WHERE i.extraction_id = a4.current_extraction_id
+                        AND i.caption_tsv @@ t.tsq
+                 ) m
+            GROUP BY m.article_id
+            HAVING count(DISTINCT t.ord) = (SELECT cardinality(terms) FROM q)
+        )"""
+
+#: The phrase recheck, unchanged in meaning and now stated once.
+#:
+#: A phrase is contiguous words, so it cannot span two blocks - under --phrase
+#: the single-vector test is the CORRECT one, and it stays. It composes with the
+#: document-level candidate set for free: if a phrase occurs in some vector then
+#: every one of its terms occurs in that vector, so a phrase match is always a
+#: subset of the candidates. The index still runs first and this only removes
+#: survivors that matched as a bag of words.
+PHRASE_HIT = ("""(
+               {PHRASE_FN}(concat_ws(' ', a.title, a.subtitle, a.description),
+                           %(query)s)
+               OR EXISTS (SELECT 1 FROM unnest(a.tags) AS tg
+                           WHERE {PHRASE_FN}(tg, %(query)s))
+               OR EXISTS (SELECT 1 FROM unnest(a.authors) AS au
+                           WHERE {PHRASE_FN}(au, %(query)s))
                OR EXISTS (SELECT 1 FROM corpus.content_block b
                            WHERE b.article_id = a.id
                              AND b.extraction_id = a.current_extraction_id
                              AND b.text_tsv @@ q.tsq
-                             AND (NOT %(phrase)s
-                                  OR {PHRASE_FN}(b.block_text, %(query)s)))
+                             AND {PHRASE_FN}(b.block_text, %(query)s))
                OR EXISTS (SELECT 1 FROM corpus.article_image i
                            WHERE i.article_id = a.id
                              AND i.extraction_id = a.current_extraction_id
                              AND i.caption_tsv @@ q.tsq
-                             AND (NOT %(phrase)s
-                                  OR {PHRASE_FN}(concat_ws(' ', i.caption, i.alt),
-                                              %(query)s))))
+                             AND {PHRASE_FN}(concat_ws(' ', i.caption, i.alt),
+                                             %(query)s)))"""
+              .replace("{PHRASE_FN}", PHRASE))
+
+#: The match predicate itself, shared by search_articles() and matching_ids().
+#: Two copies of a WHERE clause is how a ranked result list and the recall set
+#: measured against it quietly stop meaning the same thing - the same argument
+#: that put the ingestion INSERTs in one module (scripts/cx_ingest.py).
+#: Expects the CTEs in CANDIDATES, and the same parameter names.
+MATCH_WHERE = ("""a.id IN (SELECT article_id FROM doc)
+          AND (NOT %(phrase)s OR """ + PHRASE_HIT + """)
           AND (%(outlet)s  IS NULL OR a.outlet = %(outlet)s)
           AND (%(tag)s     IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
           AND (%(author)s  IS NULL OR a.authors @> ARRAY[%(author)s]::text[])
@@ -152,6 +232,39 @@ def _blocks_for(cur, article_id: int, query: str, limit: int,
     return [dict(row) for row in cur.fetchall()]
 
 
+def _blocks_for_terms(cur, article_id: int, query: str, limit: int) -> list[dict]:
+    """The passages of an article matched across vectors, best term first.
+
+    An article can now come back because its terms are spread over several
+    paragraphs. No block matches the whole query - that is the definition of
+    this case - so `_blocks_for` would return nothing and the caller would get a
+    result it cannot cite anything from.
+
+    So return the best block for EACH term instead: the evidence exists, it is
+    just distributed, and the honest presentation is one passage per term rather
+    than a single passage pretending to support the whole query. Ranked by the
+    term's own rank, deduplicated when one block happens to carry two terms.
+    """
+    cur.execute(f"""
+        SELECT DISTINCT ON (b.id)
+               b.id AS block_id, b.block_index, b.block_type, b.xpath,
+               b.block_text, t.ord AS term_ordinal,
+               ts_rank(b.text_tsv, t.tsq) AS rank,
+               ts_headline('{HEADLINE_CONFIG}', b.block_text, t.tsq,
+                           %(opts)s) AS headline
+        FROM corpus.article a
+        JOIN corpus.content_block b
+          ON b.article_id = a.id AND b.extraction_id = a.current_extraction_id
+        CROSS JOIN unnest(corpus.search_terms(%(q)s)) WITH ORDINALITY AS t(tsq, ord)
+        WHERE a.id = %(id)s
+          AND b.text_tsv @@ t.tsq
+        ORDER BY b.id, rank DESC
+    """, {"id": article_id, "q": query, "opts": HEADLINE_OPTS})
+    rows = [dict(row) for row in cur.fetchall()]
+    rows.sort(key=lambda r: (r["term_ordinal"], -float(r["rank"])))
+    return rows[:limit]
+
+
 def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = None,
                     tag: str | None = None, blocks_per_article: int = 3,
                     author: str | None = None, section: str | None = None,
@@ -181,7 +294,7 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
     `date_to` is INCLUSIVE of the whole day given.
     """
     cur.execute(f"""
-        WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
+        WITH {CANDIDATES}
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
@@ -235,10 +348,20 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
             "both" if hit["meta_match"] and hit["body_rank"]
             else "metadata" if hit["meta_match"]
             else "body" if hit["body_rank"]
-            else "caption")
-        hit["blocks"] = (_blocks_for(cur, hit["id"], query, blocks_per_article,
-                                     phrase=phrase)
-                         if hit["body_rank"] else [])
+            else "caption" if hit["caption_rank"]
+            # Every term is in the article but no single vector holds them all.
+            # Before 012 this article was not returned at all; it is the case
+            # the fix exists for, and it is labelled rather than disguised as a
+            # body hit, because no one passage supports the whole query.
+            else "document")
+        if hit["body_rank"]:
+            hit["blocks"] = _blocks_for(cur, hit["id"], query,
+                                        blocks_per_article, phrase=phrase)
+        elif hit["match_reason"] == "document":
+            hit["blocks"] = _blocks_for_terms(cur, hit["id"], query,
+                                              blocks_per_article)
+        else:
+            hit["blocks"] = []
         results.append(hit)
     return results
 
@@ -258,7 +381,7 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
     Use this for "did it find them"; use search_articles for "what to show".
     """
     cur.execute(f"""
-        WITH q AS (SELECT {QUERY}(%(query)s) AS tsq)
+        WITH {CANDIDATES}
         SELECT a.id
         FROM corpus.article a
         CROSS JOIN q

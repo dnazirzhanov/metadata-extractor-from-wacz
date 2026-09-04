@@ -646,6 +646,39 @@ instead aggregates the best block scores. For a citation-oriented tool that is
 arguably the better ranking anyway — the best passage is what you want to show.
 If whole-document ranking turns out to matter, add it then, with a measurement.
 
+**Correction, 2026-09-04 — that paragraph named the wrong cost.** Whole-document
+ranking was not the only thing the semi-join gave up. The predicate hands the
+*whole* tsquery to one vector, so every term of a multi-word AND had to land in
+the **same block**. An article whose terms are spread over its body matched
+nothing:
+
+    'orosz-ukrán háború', article #158  ->  metadata 0 blocks 0   (dropped)
+        term 1  orosz-ukrán    metadata no,   blocks [4, 9, 10]
+        term 2  háború         metadata yes,  blocks [1, 5, 6, 14]
+
+(Terms split on whitespace only, so the hyphenated compound stays one term.)
+
+That is a **recall** cost, and it was the larger one: 12 of the 13 standing
+recall misses, and `ukrajnai fejlesztés` returning 4 of the 11 articles that
+contain both words. The queries that survived were the ones whose terms are
+*adjacent* — `Orbán Viktor`, `Donald Trump` — because those land in one title,
+which is why name lookups looked healthy while topical search did not.
+
+**Fixed in 012 without adding the body vector.** `corpus.search_terms()` exposes
+the per-term tsqueries that `corpus.search_query()` was already ANDing, and
+`scripts/search.py` intersects them across vectors: each term is resolved by its
+own index-served UNION over the three GINs, and the terms are intersected by
+counting distinct ordinals. Measured on the evaluation corpus, recall misses
+went **13 → 1** (the survivor is `nyomásgyakorlás`, a compound the stemmer does
+not split), single-word results are byte-identical, and `EXPLAIN` shows no
+sequential scan on `article` or `content_block`.
+
+So the storage argument above still stands — the body vector is still not
+needed — but "the trade-off worth naming" was named incompletely for three days,
+and the search layer shipped on it. **Ranking is still the open half:** an
+article matched across vectors scores 0 and sorts last, because `ts_rank` needs
+the whole query in one vector.
+
 ### D.3 Indexes, one query each
 
 | Index | Query it serves | Needed now? |
