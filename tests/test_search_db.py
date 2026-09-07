@@ -627,43 +627,49 @@ class TestTokenisationSemantics:
             "Orbán Viktor")
 
 
-class TestKnownGapAccentFreeStopwordPhrase:
-    """A REGRESSION 021 INTRODUCED, recorded so it cannot be forgotten.
+class TestAccentFreeStopwordPhrase:
+    """The shape 021 broke and 022 fixed: accent-free needle, edge stopword,
+    accented text.
 
-    Shape: an accent-free needle, an edge stopword, and accented text.
+        phrase_match('a felek között van a vita', 'kozott van')
 
-        phrase_match('a felek között van a vita', 'kozott van')   should be True
+    Under 021 every branch declined it, each for a locally correct reason: the
+    lemma branch was edge-guarded because 'van' is a stopword there;
+    hungarian_surface stopwords 'van' too, so the folded branch was edge-guarded
+    as well; and `simple` preserves accents, so 'kozott' could not reach
+    'között'. 022 gives the folded branch a configuration with no stopword list -
+    `simple` over accent-folded text - which can never lose an edge token.
 
-    Every branch declines it, each for a locally correct reason:
-
-      * lemma   - 'van' is a stopword, so the edge guard skips the branch
-      * folded  - hungarian_surface ALSO stopwords 'van', so the edge guard
-                  skips this one too
-      * exact   - `simple` is accent-preserving, so 'kozott' does not reach
-                  'között'
-
-    Before 021 this returned True, but only through the degenerate query that
-    021 exists to prevent - a false positive rather than a real match. So 021
-    traded a false positive for a false negative in this one shape.
-
-    Measured cost on the evaluation corpus: 18 of 878 reference true positives
-    across a 120-phrase probe set. A validated fix exists - give the folded
-    branch a stopword-free configuration by running `simple` over
-    corpus.unaccent_immutable(...) instead of hungarian_surface - which takes
-    phrase_match false negatives from 44 to 16, the remainder being the separate
-    dash question in TestTokenisationSemantics.
-
-    These are strict xfails: when the fix lands they XPASS, the suite goes red,
-    and whoever landed it is forced to delete this class.
+    Found only by running the full chain against a reference computed outside
+    Postgres. The weaker property this suite asserted before - candidate filter
+    superset-of phrase_match - held throughout, because a wrong exact layer sits
+    inside a broad filter without complaint.
     """
 
-    @pytest.mark.xfail(strict=True,
-                       reason="021 regression: accent-free needle + edge "
-                              "stopword cannot reach accented text")
-    def test_accent_free_needle_reaches_accented_text_across_a_stopword(self, cur):
-        assert matches_phrase(cur, "a felek között van a vita", "kozott van")
+    @pytest.mark.parametrize("haystack,needle", [
+        ("a felek között van a vita",     "kozott van"),
+        ("mindenki számára elérhető",     "mindenki szamara"),
+        ("a döntés szerint egyre több",   "szerint egyre"),
+        ("az apja által vezetett cég",    "apja altal"),
+    ])
+    def test_an_accent_free_needle_crosses_a_stopword(self, cur, haystack, needle):
+        assert matches_phrase(cur, haystack, needle)
 
-    @pytest.mark.xfail(strict=True,
-                       reason="021 regression: same shape, different stopword")
-    def test_the_same_shape_with_szamara(self, cur):
-        assert matches_phrase(cur, "mindenki számára elérhető", "mindenki szamara")
+    @pytest.mark.parametrize("haystack,needle", [
+        ("a felek döntöttek. Van egy másik vita is.", "kozott van"),
+        ("A kormany dontott. Nem mondott arrol semmit.", "kormany arrol"),
+    ])
+    def test_but_it_is_still_a_phrase(self, cur, haystack, needle):
+        """Reach must not cost adjacency - that was 021's whole point."""
+        assert not matches_phrase(cur, haystack, needle)
+
+    def test_an_accented_slash_token_is_no_longer_torn_apart(self, cur):
+        """A second defect 022 closes by construction.
+
+        hungarian_surface unaccents as a dictionary, i.e. AFTER parsing, so an
+        accent inside a slash-joined token split it:
+        'MTI/Miniszterelnöki' became 'mti/minisztereln' + 'oki'. Folding first
+        and parsing ASCII does not.
+        """
+        assert matches_phrase(cur, "Fotó: MTI/Miniszterelnöki Sajtóiroda",
+                              "mti/miniszterelnoki sajtoiroda")
