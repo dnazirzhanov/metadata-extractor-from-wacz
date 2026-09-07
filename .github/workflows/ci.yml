@@ -103,7 +103,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e '.[dev,db]'
+        run: pip install -e '.[dev,db,api,test-api]'
 
       - name: Install psql client
         # scripts/migrate.sh runs `psql -f <path>`, so psql has to see the
@@ -128,7 +128,10 @@ jobs:
       - name: Migration ledger
         run: scripts/migrate.sh --status
 
-      - name: Search suite
+      - name: Search suite and API
+        # The API tests run here too: they need the same migrated corpus, and
+        # exercise the service through Starlette's TestClient so no port is
+        # bound and no server has to be started.
         env:
           CX_TEST_DSN: host=127.0.0.1 port=5432 user=causalia password=ci dbname=causalia
         run: pytest -q -rs
