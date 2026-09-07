@@ -230,8 +230,95 @@ HEADLINE_OPTS = ("MaxFragments=2,FragmentDelimiter= … ,"
                  "MinWords=5,MaxWords=22,StartSel=«,StopSel=»")
 
 
-def connect(dsn: str | None = None):
-    return psycopg2.connect(dsn or os.environ.get("CX_DEV_DSN", DEFAULT_DSN))
+#: The migrations this checkout ships. A database is CURRENT when it has applied
+#: every one of them; anything less and the queries below are written against a
+#: schema the server does not have.
+MIGRATIONS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations")
+
+#: Escape hatch, for the one legitimate case: driving a database THROUGH the
+#: migrations, where it is behind by construction. Never set it to silence the
+#: error in order to run a query.
+ALLOW_DRIFT_ENV = "CX_ALLOW_SCHEMA_DRIFT"
+
+
+class SchemaDrift(RuntimeError):
+    """The database is not at the schema this checkout was written against.
+
+    Raised in preference to letting a query run. A stale database does not fail
+    loudly on its own: migrations 009-018 changed what `corpus.search_query` and
+    friends RETURN, not whether they exist, so an out-of-date server answers
+    every query in this file without error and simply answers them the old way.
+    The result looks like a clean run and is not one - which is exactly the
+    failure this guard exists to make impossible.
+    """
+
+
+def expected_migrations(directory: str | None = None) -> set[str]:
+    """Migration versions present in the repo, as {'001', '002', ...}."""
+    directory = directory or MIGRATIONS_DIR
+    return {name.split("_", 1)[0]
+            for name in os.listdir(directory) if name.endswith(".sql")}
+
+
+def applied_migrations(conn) -> set[str]:
+    """Migration versions the database has applied. Empty set if unmigrated."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('corpus.schema_migrations') IS NOT NULL")
+        if not cur.fetchone()[0]:
+            return set()
+        cur.execute("SELECT version FROM corpus.schema_migrations")
+        return {row[0] for row in cur.fetchall()}
+
+
+def describe_target(conn) -> str:
+    """host:port/dbname for the open connection. Never includes the password."""
+    p = conn.get_dsn_parameters()
+    return f"{p.get('host', '?')}:{p.get('port', '?')}/{p.get('dbname', '?')}"
+
+
+def require_current_schema(conn) -> None:
+    """Refuse to work against a database behind this checkout's migrations."""
+    if os.environ.get(ALLOW_DRIFT_ENV):
+        return
+    expected, applied = expected_migrations(), applied_migrations(conn)
+    missing = expected - applied
+    if not missing:
+        return
+    target = describe_target(conn)
+    have = max(applied) if applied else "nothing"
+    raise SchemaDrift(
+        f"{target} is at migration {have}, but this checkout ships up to "
+        f"{max(expected)}.\n"
+        f"  missing: {', '.join(sorted(missing))}\n"
+        f"  The search functions exist at every version, so this database would "
+        f"have answered every query WITHOUT error - using the old behaviour.\n"
+        f"  Fix: point --dsn at a current database, or apply the migrations "
+        f"(scripts/migrate.sh). To drive migrations themselves, set "
+        f"{ALLOW_DRIFT_ENV}=1.")
+
+
+def connect(dsn: str | None = None, check_schema: bool = True):
+    """Connect, and by default refuse a database behind this checkout.
+
+    The default DSN is the DEVELOPMENT database, so a forgotten --dsn is the
+    normal way to end up somewhere unintended. The guard is what makes that
+    mistake noisy instead of silent.
+    """
+    conn = psycopg2.connect(dsn or os.environ.get("CX_DEV_DSN", DEFAULT_DSN))
+    if check_schema:
+        try:
+            require_current_schema(conn)
+        except Exception:
+            conn.close()
+            raise
+        finally:
+            # The check reads, which opens a transaction. Leave the connection
+            # as we found it: callers set autocommit straight after connect(),
+            # and psycopg2 refuses that while a transaction is open.
+            if not conn.closed:
+                conn.rollback()
+    return conn
 
 
 def _blocks_for(cur, article_id: int, query: str, limit: int,
@@ -581,6 +668,14 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
 
     connection = connect(args.dsn)
+    # Which database answered is part of the result. The dev and evaluation
+    # databases differ by 972 articles, so the same query returns honestly
+    # different numbers from each and the recall looks like a finding.
+    with connection.cursor() as _c:
+        _c.execute("SELECT count(*) FROM corpus.article")
+        print(f"-- {describe_target(connection)}  "
+              f"{_c.fetchone()[0]} articles", file=sys.stderr)
+    connection.rollback()
     with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         if args.tag_only:
             rows = filter_by_tag(cur, args.query, limit=args.limit)

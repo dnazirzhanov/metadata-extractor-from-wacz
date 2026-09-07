@@ -682,7 +682,7 @@ def main(argv: list[str]) -> int:
     S.HEADLINE_OPTS = (f"MaxFragments=2,FragmentDelimiter= … ,MinWords=6,MaxWords=26,"
                        f"StartSel={HL_START},StopSel={HL_STOP}")
 
-    connection = psycopg2.connect(args.dsn)
+    connection = S.connect(args.dsn)
     with connection.cursor() as cur, \
          connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as dict_cur:
         report = collect(cur, dict_cur)
