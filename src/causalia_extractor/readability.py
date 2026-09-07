@@ -45,20 +45,62 @@ class ReadabilityResult:
     embeds: dict[int, Embed]
 
 
+def _other_embeds(parent, node) -> list:
+    """Embeds under ``parent`` that are not ``node``.
+
+    Covers the raw players AND the ``data-embed-url`` marker that
+    ``adopt_raw_embeds`` leaves in place of one. That marker is deliberate:
+    the marker div carries no text, so once the first embed has been replaced
+    the wrapper looks empty again to ``get_text`` and the second embed would
+    climb straight over the first one's replacement and delete it.
+
+    ``protect_embeds`` escapes this by accident - its placeholder is a <p>
+    holding the token string, which ``get_text`` does see - so the bug is only
+    reachable through the adoption path. Both are handled here rather than
+    relying on that difference.
+    """
+    found = parent.find_all(["iframe", "video"])
+    found += parent.find_all(attrs={"data-embed-url": True})
+    return [element for element in found if element is not node]
+
+
 def embed_anchor(node):
     """The outermost wrapper that contains ONLY this embed.
 
     Walks up while each parent holds no other text, stopping before
     body/html/article/main so we never replace the whole document.
+
+    "Only this embed" has to be enforced against OTHER EMBEDS as well as
+    against text, because an ``<iframe>`` contributes no text: a wrapper
+    holding two players looks empty to ``get_text`` and would be claimed by
+    both of them. The first replacement then carries the second embed out of
+    the document, and replacing it raises "not part of a tree".
+
+    Found on kisalfold.hu/00/0004ea40..., two infogram iframes inside one
+    ``<app-wysiwyg-box>`` - the only hard failure in 1,008 real archives.
     """
     anchor = node
     parent = node.parent
     while parent is not None and parent.name not in ("body", "html", "article", "main"):
         if parent.get_text(strip=True):     # wrapper holds other content: stop
             break
+        if _other_embeds(parent, node):
+            break                           # wrapper holds another embed: stop
         anchor = parent
         parent = parent.parent
     return anchor
+
+
+def _placeable_anchor(node):
+    """``embed_anchor``, or None when the embed is no longer in the document.
+
+    An embed nested INSIDE another embed's anchor leaves with it. Nothing can
+    be placed for that one, and recording it anyway would put an Embed in the
+    map whose token appears nowhere - ``restore_embeds`` walks tokens, not the
+    map, so it would be silently unrestorable.
+    """
+    anchor = embed_anchor(node)
+    return anchor if anchor.parent is not None else None
 
 
 def protect_embeds(soup: BeautifulSoup) -> dict[int, Embed]:
@@ -75,11 +117,14 @@ def protect_embeds(soup: BeautifulSoup) -> dict[int, Embed]:
         if not url or url.startswith("data:"):
             frame.decompose()
             continue
+        anchor = _placeable_anchor(frame)
+        if anchor is None:
+            continue
         index += 1
         embeds[index] = Embed(url=url, kind="iframe")
         placeholder = soup.new_tag("p")
         placeholder.string = EMBED_TOKEN.format(index=index)
-        embed_anchor(frame).replace_with(placeholder)
+        anchor.replace_with(placeholder)
 
     for video in soup.find_all("video"):
         url = (video.get("src") or "").strip()
@@ -90,11 +135,14 @@ def protect_embeds(soup: BeautifulSoup) -> dict[int, Embed]:
         if not url:
             video.decompose()
             continue
+        anchor = _placeable_anchor(video)
+        if anchor is None:
+            continue
         index += 1
         embeds[index] = Embed(url=url, kind="video")
         placeholder = soup.new_tag("p")
         placeholder.string = EMBED_TOKEN.format(index=index)
-        embed_anchor(video).replace_with(placeholder)
+        anchor.replace_with(placeholder)
 
     return embeds
 
@@ -167,11 +215,14 @@ def adopt_raw_embeds(soup: BeautifulSoup, base_url: str) -> list[Embed]:
         if not raw or raw.startswith("data:"):
             frame.decompose()
             continue
+        anchor = _placeable_anchor(frame)
+        if anchor is None:
+            continue
         absolute = urljoin(base_url, raw)
         element = soup.new_tag("div")
         element["class"] = "embed"
         element["data-embed-url"] = absolute
-        embed_anchor(frame).replace_with(element)
+        anchor.replace_with(element)
         adopted.append(Embed(url=absolute, kind="iframe"))
 
     for video in list(soup.find_all("video")):
