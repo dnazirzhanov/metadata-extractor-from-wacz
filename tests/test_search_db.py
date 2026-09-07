@@ -543,3 +543,127 @@ class TestCandidateFilterInvariant:
         assert missed == 0, (
             f"{missed} block(s) satisfy phrase_match but are not candidates - "
             f"the filter is under-producing for {query!r}")
+
+
+class TestPartBRegressions:
+    """The query set the phrase-search review named explicitly.
+
+    Corpus-independent wherever possible: the document is built inline, so the
+    assertion cannot drift with what happens to be ingested.
+    """
+
+    @pytest.mark.parametrize("stopword", [
+        "arról", "között", "előtt", "saját", "ezért", "által",
+    ])
+    def test_a_stopword_phrase_requires_adjacency(self, cur, stopword):
+        """The 021 defect class, across the function words that exhibit it."""
+        adjacent = f"a kormány {stopword} beszélt"
+        apart = f"A kormány döntött. Semmit nem mondott {stopword} a kérdésről."
+        needle = f"kormány {stopword}"
+        assert matches_phrase(cur, adjacent, needle), f"adjacent {needle!r}"
+        assert not matches_phrase(cur, apart, needle), f"non-adjacent {needle!r}"
+
+    def test_orban_accent_policy_is_one_way(self, cur):
+        # Typing the accent narrows; typing without it does not.
+        assert not matches_phrase(cur, "Ludovic Orban Romaniaban", "Orbán")
+        assert matches_phrase(cur, "Orbán Viktor Brüsszelben tárgyalt", "Orban")
+
+    def test_orbannak_reaches_the_base_form(self, cur):
+        assert matches_phrase(cur, "Orbánnak üzent a miniszter", "Orbán")
+
+    def test_magyarorszagrol_case_suffix(self, cur):
+        assert matches(cur, "Magyarországról érkezett a hír", "Magyarországról")
+        assert matches(cur, "Magyarországról érkezett a hír", "Magyarorszagrol")
+
+    def test_europai_unio_is_a_phrase(self, cur):
+        assert matches_phrase(cur, "az Európai Unió döntése", "Európai Unió")
+        assert not matches_phrase(cur, "az Unió és az Európai Tanács",
+                                  "Európai Unió")
+
+    def test_kor_and_kór_stay_apart(self, cur):
+        assert not matches_phrase(cur, "a kor jo volt", "kór")
+        assert matches_phrase(cur, "a kór terjedt", "kór")
+        # ...but the accent-free spelling still reaches both, by design.
+        assert matches_phrase(cur, "a kór terjedt", "kor")
+
+
+class TestTokenisationSemantics:
+    """Hyphens and compounds - PINNED DELIBERATELY, not inherited.
+
+    These assertions encode a product decision, so that Postgres's parser cannot
+    change the product's meaning by accident. They record what the engine does
+    TODAY. If the team decides a dash variant should be interchangeable, or that
+    a phrase should be findable inside a compound, these are the tests to change
+    first - and their failure is then the signal that the decision was acted on,
+    not a regression.
+
+    Measured on the evaluation corpus: treating every dash variant as
+    interchangeable would recover 17 further true positives out of 878 across a
+    120-phrase probe set (roughly 1.9%).
+    """
+
+    def test_a_hyphenated_compound_matches_its_own_spelling(self, cur):
+        assert matches_phrase(cur, "az orosz-ukrán háború kitört",
+                              "orosz-ukrán háború")
+
+    def test_an_en_dash_is_currently_NOT_the_same_as_a_hyphen(self, cur):
+        """CURRENT BEHAVIOUR, and a decision the team may reverse.
+
+        'orosz–ukrán' (U+2013) and 'orosz-ukrán' (U+002D) tokenise differently:
+        the hyphen produces a compound plus its parts, the en dash produces only
+        the parts. A Hungarian newsroom uses both typographies for one word.
+        """
+        assert not matches_phrase(cur, "az orosz–ukrán háború kitört",
+                                  "orosz-ukrán háború")
+
+    def test_a_phrase_is_currently_NOT_found_inside_a_compound(self, cur):
+        """CURRENT BEHAVIOUR, and a decision the team may reverse.
+
+        'Orbán Viktor-fóbia' tokenises 'Viktor-fóbia' as a compound, so the
+        phrase 'Orbán Viktor' does not occur inside it.
+        """
+        assert not matches_phrase(
+            cur, "Már megint elhatalmasodott rajtad az Orbán Viktor-fóbia!!",
+            "Orbán Viktor")
+
+
+class TestKnownGapAccentFreeStopwordPhrase:
+    """A REGRESSION 021 INTRODUCED, recorded so it cannot be forgotten.
+
+    Shape: an accent-free needle, an edge stopword, and accented text.
+
+        phrase_match('a felek között van a vita', 'kozott van')   should be True
+
+    Every branch declines it, each for a locally correct reason:
+
+      * lemma   - 'van' is a stopword, so the edge guard skips the branch
+      * folded  - hungarian_surface ALSO stopwords 'van', so the edge guard
+                  skips this one too
+      * exact   - `simple` is accent-preserving, so 'kozott' does not reach
+                  'között'
+
+    Before 021 this returned True, but only through the degenerate query that
+    021 exists to prevent - a false positive rather than a real match. So 021
+    traded a false positive for a false negative in this one shape.
+
+    Measured cost on the evaluation corpus: 18 of 878 reference true positives
+    across a 120-phrase probe set. A validated fix exists - give the folded
+    branch a stopword-free configuration by running `simple` over
+    corpus.unaccent_immutable(...) instead of hungarian_surface - which takes
+    phrase_match false negatives from 44 to 16, the remainder being the separate
+    dash question in TestTokenisationSemantics.
+
+    These are strict xfails: when the fix lands they XPASS, the suite goes red,
+    and whoever landed it is forced to delete this class.
+    """
+
+    @pytest.mark.xfail(strict=True,
+                       reason="021 regression: accent-free needle + edge "
+                              "stopword cannot reach accented text")
+    def test_accent_free_needle_reaches_accented_text_across_a_stopword(self, cur):
+        assert matches_phrase(cur, "a felek között van a vita", "kozott van")
+
+    @pytest.mark.xfail(strict=True,
+                       reason="021 regression: same shape, different stopword")
+    def test_the_same_shape_with_szamara(self, cur):
+        assert matches_phrase(cur, "mindenki számára elérhető", "mindenki szamara")
