@@ -29,6 +29,11 @@ dev = ["pytest>=7.4"]
 # and there is a test asserting it. Used by scripts/ (migrations, ingestion
 # validation), which is not part of the package.
 db = ["psycopg2-binary>=2.9"]
+# The read-only search and evidence API in service/. Also not a runtime
+# dependency of causalia_extractor, for the same reason: the extractor opens no
+# socket, and there is a test asserting it.
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "psycopg2-binary>=2.9"]
+test-api = ["httpx>=0.27"]
 
 [project.scripts]
 causalia-extractor = "causalia_extractor.cli:main"
