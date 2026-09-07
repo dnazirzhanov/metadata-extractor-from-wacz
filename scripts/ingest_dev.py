@@ -24,6 +24,7 @@ import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cx_ingest import ingest                                   # noqa: E402
+import search                                                  # noqa: E402
 
 DEFAULT_DSN = ("host=127.0.0.1 port=55433 user=causalia password=dev "
                "dbname=causalia_dev")
@@ -63,7 +64,7 @@ def main(argv: list[str]) -> int:
         print(f"no article directories under {root}", file=sys.stderr)
         return 1
 
-    connection = psycopg2.connect(args.dsn)
+    connection = search.connect(args.dsn)
     with connection.cursor() as cur:
         before = counts(cur)
     pass_number = 1 if before["article_extraction"] == 0 else \

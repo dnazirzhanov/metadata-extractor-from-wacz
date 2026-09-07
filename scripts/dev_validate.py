@@ -982,7 +982,7 @@ def main(argv: list[str]) -> int:
         return 1
     repo = Path(__file__).resolve().parent.parent
 
-    connection = psycopg2.connect(args.dsn)
+    connection = search_layer.connect(args.dsn)
     connection.autocommit = False
     cur = connection.cursor()
     dict_cur = connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
