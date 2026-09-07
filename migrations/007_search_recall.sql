@@ -280,6 +280,73 @@ COMMENT ON SCHEMA corpus IS
     'are referenced by stored generated columns, so changing either requires '
     'rebuilding them (see migrations/007).';
 
+-- ---------------------------------------------------------------------
+-- Backfilled. 007-009 shipped with no self-check, and that is not a
+-- theoretical gap: 009's corpus.phrase_match went out with a defect nobody
+-- found until 014. These assertions run inside the migration's own
+-- transaction, so a fresh database that cannot satisfy them refuses to be
+-- built. They are pure assertions - no DDL - so the schema an existing
+-- database already has is provably unchanged by adding them.
+--
+-- Scope note: a verify block can only assert what is true AT ITS OWN
+-- migration. Nothing here may depend on 010's lemma guard, 015's prefix
+-- threshold or 017's accent sensitivity, all of which change these answers
+-- later. Only invariants 007 itself establishes are pinned.
+-- ---------------------------------------------------------------------
+DO $verify$
+BEGIN
+    -- Both configurations 007 introduces exist. The STORED generated columns
+    -- name them, so a missing one desynchronises every vector silently.
+    IF (SELECT count(*) FROM pg_ts_config c
+          JOIN pg_namespace n ON n.oid = c.cfgnamespace
+         WHERE n.nspname = 'corpus'
+           AND c.cfgname IN ('hungarian_lemma', 'hungarian_surface')) <> 2 THEN
+        RAISE EXCEPTION '007 did not leave both text-search configurations behind';
+    END IF;
+
+    -- Real Hungarian text produces a vector at all.
+    IF corpus.search_vector('a kormány döntött') = ''::tsvector THEN
+        RAISE EXCEPTION 'search_vector produced nothing for real Hungarian text';
+    END IF;
+
+    -- The contract: a document answers a query for a word it contains.
+    IF NOT corpus.search_vector('a kormány döntött')
+           @@ corpus.search_query('kormány') THEN
+        RAISE EXCEPTION 'a document does not answer a query for its own word';
+    END IF;
+
+    -- And answers the ACCENT-FREE spelling of it, which is why 007 exists.
+    IF NOT corpus.search_vector('a kormány döntött')
+           @@ corpus.search_query('kormany') THEN
+        RAISE EXCEPTION 'the accent-free spelling does not reach the accented word';
+    END IF;
+
+    -- An inflected form reaches its base word: the recall 007 was written for.
+    IF NOT corpus.search_vector('a kormányban dolgozik')
+           @@ corpus.search_query('kormány') THEN
+        RAISE EXCEPTION 'an inflected form does not answer its base word';
+    END IF;
+
+    -- A word the document does not contain must NOT match.
+    IF corpus.search_vector('a kormány döntött')
+       @@ corpus.search_query('halászat') THEN
+        RAISE EXCEPTION 'search_query matched a word the document does not contain';
+    END IF;
+
+    -- unaccent_immutable has to fold, and has to be IMMUTABLE or the generated
+    -- columns could not reference it at all.
+    IF corpus.unaccent_immutable('árvíz') <> 'arviz' THEN
+        RAISE EXCEPTION 'unaccent_immutable does not fold accents: %',
+            corpus.unaccent_immutable('árvíz');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'corpus' AND p.proname = 'unaccent_immutable'
+                      AND p.provolatile = 'i') THEN
+        RAISE EXCEPTION 'unaccent_immutable is not IMMUTABLE';
+    END IF;
+END
+$verify$;
+
 INSERT INTO corpus.schema_migrations (version) VALUES ('007')
     ON CONFLICT (version) DO NOTHING;
 

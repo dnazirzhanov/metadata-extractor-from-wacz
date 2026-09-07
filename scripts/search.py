@@ -321,6 +321,90 @@ def connect(dsn: str | None = None, check_schema: bool = True):
     return conn
 
 
+# ---------------------------------------------------------------------
+# Query syntax this engine does not implement
+# ---------------------------------------------------------------------
+#
+# corpus.search_terms splits on whitespace and hyphens and ANDs the pieces. It
+# has no notion of an operator, so anything an operator-shaped token contains
+# becomes an ordinary REQUIRED WORD. Nothing errors; the query simply answers a
+# different question:
+#
+#     kormány OR Ukrajna   ->  'kormány' & 'or' & 'ukrajna'      6 articles, not ~370
+#     kormány NOT Ukrajna  ->  'kormány' & 'not' & 'ukrajna'     3
+#     title:kormány        ->  'kormány' & 'title'               0
+#     korm*                ->  'korm'                            167
+#
+# and the worst of them inverts the reader's intent outright, because 013 made
+# `-` a term separator so the minus is simply eaten:
+#
+#     kormány -Ukrajna     ->  'kormány' & 'ukrajna'   the 49 that DO contain it
+#
+# Refusing is deliberately not the same as implementing. Real boolean syntax is
+# a design decision with a ranking story attached (how does a NOT branch score?)
+# and it is not made here. This only ensures the reader is told, rather than
+# handed a confident wrong answer.
+
+class UnsupportedQuerySyntax(ValueError):
+    """The query uses syntax this engine does not implement."""
+
+
+#: Bare boolean words, uppercase only. Lowercase 'or'/'and' are ordinary tokens
+#: a reader might legitimately be searching for in quoted foreign text; the
+#: uppercase spelling is the one that only ever means the operator.
+BOOLEAN_WORDS = {"AND", "OR", "NOT"}
+
+#: Boolean punctuation, as whole tokens.
+BOOLEAN_SYMBOLS = {"&", "&&", "|", "||", "!"}
+
+#: Field-scoping prefixes. Deliberately a fixed list rather than the general
+#: `word:` shape: Hungarian attribution headlines are full of colons - "Orbán
+#: Viktor: nem szabad ..." is a real title in this corpus - and rejecting those
+#: would break ordinary searching to catch a syntax nobody can use anyway.
+FIELD_PREFIXES = ("title:", "author:", "outlet:", "tag:", "section:",
+                  "date:", "from:", "to:", "url:", "text:", "body:")
+
+
+def unsupported_syntax(query: str) -> list[str]:
+    """Operator-shaped tokens in `query`, described for a human. Empty if none."""
+    problems: list[str] = []
+    for token in (query or "").split():
+        low = token.lower()
+        if token in BOOLEAN_WORDS:
+            problems.append(
+                f"{token!r} is not a boolean operator here - it would be searched "
+                f"for as an ordinary required word")
+        elif token in BOOLEAN_SYMBOLS:
+            problems.append(f"{token!r} is not a boolean operator here")
+        elif token.startswith("-") and len(token) > 1:
+            problems.append(
+                f"{token!r} does not exclude anything - the leading '-' is a term "
+                f"separator, so this REQUIRES {token.lstrip('-')!r} instead of "
+                f"excluding it")
+        elif token.endswith("*") and len(token) > 1:
+            problems.append(
+                f"{token!r} is not a wildcard - the '*' is dropped and "
+                f"{token.rstrip('*')!r} is searched for as a whole word")
+        elif low.startswith(FIELD_PREFIXES):
+            problems.append(
+                f"{token!r} is not a field-scoped search - the field name would "
+                f"be searched for as an ordinary required word")
+    return problems
+
+
+def require_supported_syntax(query: str) -> None:
+    """Raise rather than answer a different question than the one asked."""
+    problems = unsupported_syntax(query)
+    if not problems:
+        return
+    raise UnsupportedQuerySyntax(
+        "this query uses syntax the search engine does not implement:\n"
+        + "\n".join(f"  - {p}" for p in problems)
+        + "\n  Supported: words (all must appear), --phrase for an adjacent"
+          " sequence,\n  and the --outlet/--tag/--author/--section/--from/--to"
+          " filters.")
+
+
 def _blocks_for(cur, article_id: int, query: str, limit: int,
                 phrase: bool = False) -> list[dict]:
     """The matching blocks of an article, best first.
@@ -383,7 +467,8 @@ def _blocks_for_terms(cur, article_id: int, query: str, limit: int) -> list[dict
     return rows[:limit]
 
 
-def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = None,
+def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
+                    outlet: str | None = None,
                     tag: str | None = None, blocks_per_article: int = 3,
                     author: str | None = None, section: str | None = None,
                     date_from: str | None = None, date_to: str | None = None,
@@ -411,6 +496,7 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
     index - it only removes survivors that matched as a bag of words.
     `date_to` is INCLUSIVE of the whole day given.
     """
+    require_supported_syntax(query)
     cur.execute(f"""
         WITH {CANDIDATES}
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
@@ -502,8 +588,9 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                  -- a result list is in unspecified order and a harness that
                  -- diffs two runs reports changes that are not changes.
                  a.id
-        LIMIT %(limit)s
+        LIMIT %(limit)s OFFSET %(offset)s
     """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit,
+          "offset": offset,
           "author": author, "section": section, "phrase": phrase,
           "date_from": date_from, "date_to": date_to})
 
@@ -570,8 +657,10 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
 
 
 def search_article_content(cur, query: str, *, limit: int = 20,
+                           offset: int = 0,
                            phrase: bool = False) -> list[dict]:
     """Block-level search: the citable unit, straight out."""
+    require_supported_syntax(query)
     cur.execute(f"""
         SELECT b.id AS block_id, b.article_id, a.title, a.outlet, a.url_hash,
                b.block_index, b.block_type, b.xpath, b.block_text,
@@ -583,9 +672,14 @@ def search_article_content(cur, query: str, *, limit: int = 20,
         WHERE b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
           AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
-        ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index
-        LIMIT %(limit)s
-    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit, "phrase": phrase})
+        -- b.id is the deterministic last resort, for the same reason
+        -- search_articles carries a.id: without it two blocks on one rank are
+        -- in unspecified order, and OFFSET would then be able to skip a row or
+        -- return it twice across pages.
+        ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index, b.id
+        LIMIT %(limit)s OFFSET %(offset)s
+    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit, "offset": offset,
+          "phrase": phrase})
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -656,6 +750,12 @@ def main(argv: list[str]) -> int:
                         metavar="YYYY-MM-DD",
                         help="published on or before (inclusive of that day)")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--offset", type=int, default=0,
+                        help="skip this many results - page 2 of a --limit 10 "
+                             "search is --offset 10")
+    parser.add_argument("--blocks-per-article", type=int, default=3,
+                        dest="blocks_per_article", metavar="N",
+                        help="matching passages to attach to each article")
     parser.add_argument("--phrase", action="store_true",
                         help="require the query as an adjacent word sequence, "
                              "not as a bag of words")
@@ -666,6 +766,59 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--blocks", action="store_true",
                         help="block-level search instead of article search")
     args = parser.parse_args(argv[1:])
+
+    # The three secondary modes dispatch to functions that do not take the
+    # filter keywords, so argparse accepting a flag never meant the search
+    # honoured it: `--tag-only --from 2099-01-01` returned 38 articles, and a
+    # 2099 date filter must return none. Silently dropping a filter answers a
+    # different question than the one asked, so refuse instead.
+    IGNORED_BY = {
+        "--tag-only":    ("outlet", "tag", "author", "section",
+                          "date_from", "date_to", "phrase"),
+        "--author-only": ("outlet", "tag", "author", "section",
+                          "date_from", "date_to", "phrase"),
+        # --blocks does honour --phrase; it takes no other filter.
+        "--blocks":      ("outlet", "tag", "author", "section",
+                          "date_from", "date_to"),
+    }
+    FLAG_OF = {"outlet": "--outlet", "tag": "--tag", "author": "--author",
+               "section": "--section", "date_from": "--from",
+               "date_to": "--to", "phrase": "--phrase"}
+    chosen = [m for m, a in (("--tag-only", args.tag_only),
+                             ("--author-only", args.author_only),
+                             ("--blocks", args.blocks)) if a]
+    if len(chosen) > 1:
+        print(f"error: {' and '.join(chosen)} are mutually exclusive - "
+              f"they are different searches, not filters on one search",
+              file=sys.stderr)
+        return 2
+    if chosen:
+        mode = chosen[0]
+        offenders = [FLAG_OF[d] for d in IGNORED_BY[mode]
+                     if getattr(args, d, None)]
+        WHY = {
+            "--tag-only": "an exact filter over the tags column, not a "
+                          "full-text search, so the article filters do not "
+                          "apply to it",
+            "--author-only": "an exact filter over the authors column, not a "
+                             "full-text search, so the article filters do not "
+                             "apply to it",
+            "--blocks": "a search over blocks rather than articles, and a "
+                        "block carries none of the article-level columns these "
+                        "filters test",
+        }
+        if offenders:
+            print(f"error: {mode} cannot honour {', '.join(offenders)}\n"
+                  f"  {mode} is {WHY[mode]}.\n"
+                  f"  Drop {'them' if len(offenders) > 1 else 'it'}, or drop "
+                  f"{mode} to search with filters.", file=sys.stderr)
+            return 2
+
+    try:
+        require_supported_syntax(args.query)
+    except UnsupportedQuerySyntax as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     connection = connect(args.dsn)
     # Which database answered is part of the result. The dev and evaluation
@@ -690,6 +843,7 @@ def main(argv: list[str]) -> int:
                       f"{row['title']}")
         elif args.blocks:
             rows = search_article_content(cur, args.query, limit=args.limit,
+                                          offset=args.offset,
                                           phrase=args.phrase)
             kind = "phrase" if args.phrase else "block"
             print(f"== {kind} search {args.query!r}: {len(rows)} block(s)")
@@ -700,6 +854,8 @@ def main(argv: list[str]) -> int:
                 print(f"   {row['xpath']}")
         else:
             rows = search_articles(cur, args.query, limit=args.limit,
+                                   offset=args.offset,
+                                   blocks_per_article=args.blocks_per_article,
                                    outlet=args.outlet, tag=args.tag,
                                    author=args.author, section=args.section,
                                    date_from=args.date_from,
