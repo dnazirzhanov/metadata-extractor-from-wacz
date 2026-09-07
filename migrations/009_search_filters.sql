@@ -126,6 +126,43 @@ COMMENT ON FUNCTION corpus.phrase_match(text, text) IS
     'fabricate adjacency. Always pair with corpus.search_query() as an '
     'index-served prefilter - this function alone forces a sequential scan.';
 
+-- ---------------------------------------------------------------------
+-- Backfilled - see the note in 007. Assertions only, no DDL.
+--
+-- Deliberately does NOT assert the 'orra'/'Orban' collision. That defect was
+-- LIVE in 009 and was not closed until 014's lemma guard, so asserting it here
+-- would make a correct historical replay of the migrations fail. It is pinned
+-- in 014's own verify block and in tests/test_search_db.py instead.
+-- ---------------------------------------------------------------------
+DO $verify$
+BEGIN
+    -- Adjacency is the whole point: the phrase must be found when the words are
+    -- adjacent and rejected when they are not.
+    IF NOT corpus.phrase_match('Orbán Viktor beszélt', 'Orbán Viktor') THEN
+        RAISE EXCEPTION 'phrase_match cannot find an adjacent phrase';
+    END IF;
+    IF corpus.phrase_match('Viktor és Orbán találkozott', 'Orbán Viktor') THEN
+        RAISE EXCEPTION 'phrase_match accepted the words in the wrong order';
+    END IF;
+    IF corpus.phrase_match('Orbán a miniszterelnök, Viktor a keresztneve',
+                           'Orbán Viktor') THEN
+        RAISE EXCEPTION 'phrase_match accepted a non-adjacent pair';
+    END IF;
+
+    -- A single-word needle still works - the degenerate phrase.
+    IF NOT corpus.phrase_match('a kormány döntött', 'kormány') THEN
+        RAISE EXCEPTION 'phrase_match fails on a one-word needle';
+    END IF;
+
+    -- The author index 009 adds is what makes the exact byline filter cheap.
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                    WHERE schemaname = 'corpus' AND tablename = 'article'
+                      AND indexdef ILIKE '%gin%authors%') THEN
+        RAISE EXCEPTION '009 did not leave a GIN index on authors';
+    END IF;
+END
+$verify$;
+
 INSERT INTO corpus.schema_migrations (version) VALUES ('009')
     ON CONFLICT (version) DO NOTHING;
 

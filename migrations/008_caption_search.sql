@@ -93,6 +93,37 @@ CREATE INDEX IF NOT EXISTS article_image_caption_tsv_idx
 -- columns NULL - 0 of 33 - so the column would ship unexercised and untested.
 -- Add it the day the extractor starts filling them, with a corpus to verify it
 -- against.
+-- ---------------------------------------------------------------------
+-- Backfilled - see the note in 007. Assertions only, no DDL.
+-- ---------------------------------------------------------------------
+DO $verify$
+BEGIN
+    -- The column exists and is GENERATED. If it were an ordinary column the
+    -- extractor would have to remember to fill it, and a caption ingested by
+    -- older code would be silently unsearchable.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'corpus' AND table_name = 'article_image'
+                      AND column_name = 'caption_tsv'
+                      AND is_generated = 'ALWAYS') THEN
+        RAISE EXCEPTION 'article_image.caption_tsv is missing or not generated';
+    END IF;
+
+    -- A caption is searchable by the same query function as body text: 008's
+    -- whole purpose is that a photo caption is DISCOVERABLE.
+    IF NOT corpus.search_vector('Orbán Viktor a sajtótájékoztatón')
+           @@ corpus.search_query('sajtótájékoztató') THEN
+        RAISE EXCEPTION 'caption text is not reachable by search_query';
+    END IF;
+
+    -- 008 indexes caption, alt and credit together, so the vector must be built
+    -- from the concatenation rather than from the caption alone.
+    IF corpus.search_vector(concat_ws(' ', 'egy felirat', 'egy alt', 'egy credit'))
+       = ''::tsvector THEN
+        RAISE EXCEPTION 'the caption/alt/credit concatenation produced no vector';
+    END IF;
+END
+$verify$;
+
 INSERT INTO corpus.schema_migrations (version) VALUES ('008')
     ON CONFLICT (version) DO NOTHING;
 
