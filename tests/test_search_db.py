@@ -673,3 +673,60 @@ class TestAccentFreeStopwordPhrase:
         """
         assert matches_phrase(cur, "Fotó: MTI/Miniszterelnöki Sajtóiroda",
                               "mti/miniszterelnoki sajtoiroda")
+
+
+class TestShortAccentedLemma:
+    """Migration 023: a word whose accented lemma is two characters long.
+
+    'két' ("two") could not find itself. The index holds its accent-preserving
+    lemma 'ké'; 010 refuses to put a lemma that short into a query because it is
+    a collision magnet; the accented branch then falls through to the raw
+    spelling 'két', which the index never stores. Every branch declined.
+
+    020 had already built the fallback this needed - drop to the accent-folded
+    surface form - but tested for it at the wrong moment, asking whether
+    accented_lexemes() was EMPTY. For 'két' it returns {ké} and 010's guard
+    discards it several lines later. 023 tests whether the lemma branch
+    CONTRIBUTED, which covers both routes.
+
+    Found while building a full-paragraph search demonstration: search_query
+    ANDs every term, so one unmatchable word makes a whole paragraph unfindable.
+    """
+
+    @pytest.mark.parametrize("document,needle", [
+        ("két évtizede tart", "két"),
+        ("idén nyáron történt", "idén"),
+    ])
+    def test_a_short_accented_word_finds_itself(self, cur, document, needle):
+        assert matches(cur, document, needle)
+
+    def test_a_whole_paragraph_containing_one_is_findable(self, cur):
+        """The case that exposed it. One unmatchable term sinks the paragraph."""
+        para = ("Emlékeztettek arra, hogy a Lungo Drom több mint két évtizede "
+                "szövetségese a Fidesznek és az Orbán-kormánynak.")
+        assert matches(cur, para, para)
+
+    @pytest.mark.parametrize("document,needle", [
+        ("a kor jó volt", "kór"),      # lemma 'kór', 3 chars - untouched
+        ("a part menten", "párt"),     # lemma 'párt', 4 chars - untouched
+    ])
+    def test_a_word_with_a_usable_lemma_stays_accent_sensitive(self, cur, document, needle):
+        """023 must not widen the fallback to words 017 correctly separates."""
+        assert not matches(cur, document, needle)
+
+    def test_the_short_lemma_is_still_kept_out_of_the_query(self, cur):
+        """023 adds an alternative beside the guard; it does not repeal it."""
+        cur.execute("SELECT corpus.search_query('két')::text")
+        assert "'ké'" not in cur.fetchone()[0]
+        cur.execute("SELECT corpus.search_query('Orban')::text")
+        assert "'or'" not in cur.fetchone()[0]      # 010 still holds
+
+    def test_iden_still_does_not_reach_identitas(self, cur):
+        """The risk 023 takes, pinned.
+
+        015 chose a prefix threshold of 7 partly so 'idén' would not reach
+        'identitás'. The folded alternative 'iden' is four characters and so
+        carries no prefix - but this is the assertion to watch if anyone lowers
+        corpus.prefix_min_length().
+        """
+        assert not matches(cur, "az identitás kérdése", "idén")

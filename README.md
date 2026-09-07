@@ -192,3 +192,29 @@ PostgreSQL ingestion is deliberately **not** implemented. See
 [docs/postgres-shape.md](docs/postgres-shape.md) for the shape the output is
 designed to land in; the schema should be written against real extractor output,
 not against assumptions about it.
+
+## Demonstrating the search engine
+
+[`MENTOR_DEMO.sql`](MENTOR_DEMO.sql) is a runnable walkthrough of every search
+capability, in a ten-minute order, written to be executed statement by statement
+from a SQL console. Every query in it was executed against the evaluation
+database before it was written down, and the counts in its comments are the
+counts it returned — including the two limitations it deliberately shows rather
+than hides.
+
+The database listens on loopback on milab2, so open a tunnel first:
+
+```bash
+ssh -N -L 55435:127.0.0.1:55435 c0cshf@10.1.12.63
+```
+
+Then point a PostgreSQL data source at `127.0.0.1:55435`, database
+`causalia_eval`, user `causalia`, password `eval`. In IntelliJ or DataGrip open
+the file against that data source and run one statement at a time with
+`Ctrl/Cmd+Enter` — the demo reads as a narrative and the comments say what to
+point out at each step.
+
+The same file runs unchanged against `causalia_d1` on port 55440 (the 16,008
+article random sample from the D1 staged ingest), where the counts are roughly
+14× larger. Use `causalia_eval` for a demonstration: its numbers are the ones in
+the comments, and it is the corpus every published figure is measured against.
