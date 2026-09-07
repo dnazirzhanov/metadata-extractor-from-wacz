@@ -82,6 +82,12 @@ def dcur(conn):
         yield c
 
 
+def matches_phrase(cur, document: str, needle: str) -> bool:
+    """Does `document` contain `needle` as a phrase? Corpus-independent."""
+    cur.execute("SELECT corpus.phrase_match(%s, %s)", (document, needle))
+    return cur.fetchone()[0]
+
+
 def matches(cur, document: str, query: str) -> bool:
     """Does `document` answer `query`? Built inline, so corpus-independent."""
     cur.execute("SELECT corpus.search_vector(%s) @@ corpus.search_query(%s)",
@@ -412,3 +418,128 @@ class TestSchemaGuard:
         applied = S.applied_migrations(conn)
         assert not expected - applied, (
             "the test database is behind this checkout; migrate it first")
+
+
+class TestPhraseSemantics:
+    """The contract migration 021 gave ``corpus.phrase_match``.
+
+    These are corpus-independent: every document is built inline, so the answer
+    cannot depend on what happens to be ingested.
+
+    ``phrase_match`` is the EXACT layer behind the GIN candidate filter. Before
+    021 it was not: a Hungarian function word at either end of a phrase was
+    dropped by the lemma configuration's stopword list, which silently turned a
+    two-word phrase into a one-word query, and an accented needle could reach
+    accent-folded text through the surface branch, contradicting 017. The
+    pipeline only looked right because the candidate filter's stricter accent
+    policy overrode it upstream.
+    """
+
+    # -- adjacency, including across Hungarian function words --------------
+
+    def test_a_trailing_stopword_still_requires_adjacency(self, cur):
+        # Defect A. 'arról' is a stopword in the lemma configuration, so
+        # phraseto_tsquery dropped it and the phrase became just 'kormány'.
+        assert not matches_phrase(
+            cur, "A kormány döntött. Erről semmit nem mondott arról a kérdésről.",
+            "kormány arról")
+
+    def test_a_leading_stopword_still_requires_adjacency(self, cur):
+        assert not matches_phrase(
+            cur, "arról beszélt, majd a kormány döntött", "arról kormány")
+
+    def test_an_adjacent_stopword_phrase_still_matches(self, cur):
+        assert matches_phrase(cur, "a kormány arról beszélt", "kormány arról")
+
+    def test_the_accent_free_spelling_of_a_stopword_phrase_matches(self, cur):
+        assert matches_phrase(cur, "a kormany arrol beszelt", "kormany arrol")
+
+    def test_an_interior_stopword_is_not_collateral_damage(self, cur):
+        # An interior stopword becomes a <N> gap, which is correct. Only edge
+        # stopwords break the phrase, and the guard must tell them apart.
+        assert matches_phrase(cur, "a kormány arról döntött",
+                              "kormány arról döntött")
+
+    # -- accent policy, which 017 makes one-way ----------------------------
+
+    def test_an_accented_needle_does_not_reach_folded_text(self, cur):
+        # Defect B. Found on real blocks: Ludovic Orban, the Romanian
+        # politician, was answering a search for Orbán.
+        assert not matches_phrase(cur, "Ludovic Orban Romaniaban", "Orbán")
+        assert not matches_phrase(cur, "a kor jo volt", "kór")
+
+    def test_an_accent_free_needle_still_reaches_accented_text(self, cur):
+        # The other direction must NOT close: 017 is one-way, and this is what
+        # a reader with no Hungarian keyboard depends on.
+        assert matches_phrase(cur, "Orbán Viktor Brüsszelben tárgyalt", "Orban")
+        assert matches_phrase(cur, "Orban Viktor Brusszelben targyalt", "Orban")
+
+    def test_an_accented_needle_finds_its_own_spelling(self, cur):
+        assert matches_phrase(cur, "a kór terjedt", "kór")
+
+    # -- what 014 established and 021 must not have broken -----------------
+
+    def test_014_a_nose_is_not_a_prime_minister(self, cur):
+        assert not matches_phrase(cur, "az apja orra a tóban", "Orban")
+
+    def test_inflection_is_still_tolerated(self, cur):
+        assert matches_phrase(cur, "Orbánnak üzent a miniszter", "Orbán")
+
+    def test_order_decides(self, cur):
+        assert matches_phrase(cur, "Orbán Viktor Brüsszelben tárgyalt",
+                              "Orbán Viktor")
+        assert not matches_phrase(cur, "Orbán Viktor Brüsszelben tárgyalt",
+                                  "Viktor Orbán")
+
+    def test_a_hyphenated_compound_is_a_phrase_and_keeps_its_order(self, cur):
+        assert matches_phrase(cur, "az orosz-ukrán háború", "orosz-ukrán háború")
+        assert not matches_phrase(cur, "az orosz-ukrán háború",
+                                  "háború orosz-ukrán")
+
+    def test_null_handling_is_unchanged(self, cur):
+        # phrase_match is deliberately not STRICT - it decides its own answer.
+        cur.execute("SELECT corpus.phrase_match(NULL, 'kormány'),"
+                    "       corpus.phrase_match('a kormány döntött', NULL)")
+        assert cur.fetchone() == (False, False)
+
+    # -- the edge guard itself ---------------------------------------------
+
+    @pytest.mark.parametrize("needle,survives", [
+        ("kormány arról",         False),   # trailing stopword
+        ("arról kormány",         False),   # leading stopword
+        ("arról",                 False),   # nothing but a stopword
+        ("kormány arról döntött", True),    # interior - becomes a <N> gap
+        ("kormány kormány",       True),    # a repeat is two tokens, not one
+        ("orosz-ukrán háború",    True),    # compound expands, edges intact
+        ("kormány Ukrajna",       True),
+    ])
+    def test_phrase_edges_survive(self, cur, needle, survives):
+        cur.execute("SELECT corpus.phrase_edges_survive("
+                    "'corpus.hungarian_lemma', %s)", (needle,))
+        assert cur.fetchone()[0] is survives
+
+
+class TestCandidateFilterInvariant:
+    """The architectural invariant the whole pipeline rests on.
+
+    The GIN candidate filter is allowed to over-produce. It must never
+    under-produce: a block the exact layer accepts has to be inside the
+    candidate set, or the pipeline silently loses it. Before 021 this failed on
+    real corpus blocks - 2 for 'Orbán', 40 for 'kór', 321 for 'kormány arról' -
+    though in every case it was phrase_match that was wrong, not the filter.
+    """
+
+    @pytest.mark.parametrize("query", [
+        "Orbán", "Orban", "Orbánnak", "Magyarországról",
+        "kormány arról", "orosz-ukrán háború", "kór", "Európai Unió",
+    ])
+    def test_no_exact_match_falls_outside_the_candidate_set(self, cur, query):
+        cur.execute("""
+            SELECT count(*) FROM corpus.content_block b
+             WHERE corpus.phrase_match(b.block_text, %(q)s)
+               AND NOT (b.text_tsv @@ corpus.search_query(%(q)s))
+        """, {"q": query})
+        missed = cur.fetchone()[0]
+        assert missed == 0, (
+            f"{missed} block(s) satisfy phrase_match but are not candidates - "
+            f"the filter is under-producing for {query!r}")
