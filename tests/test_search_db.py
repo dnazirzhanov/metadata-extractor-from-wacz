@@ -543,3 +543,133 @@ class TestCandidateFilterInvariant:
         assert missed == 0, (
             f"{missed} block(s) satisfy phrase_match but are not candidates - "
             f"the filter is under-producing for {query!r}")
+
+
+class TestPartBRegressions:
+    """The query set the phrase-search review named explicitly.
+
+    Corpus-independent wherever possible: the document is built inline, so the
+    assertion cannot drift with what happens to be ingested.
+    """
+
+    @pytest.mark.parametrize("stopword", [
+        "arról", "között", "előtt", "saját", "ezért", "által",
+    ])
+    def test_a_stopword_phrase_requires_adjacency(self, cur, stopword):
+        """The 021 defect class, across the function words that exhibit it."""
+        adjacent = f"a kormány {stopword} beszélt"
+        apart = f"A kormány döntött. Semmit nem mondott {stopword} a kérdésről."
+        needle = f"kormány {stopword}"
+        assert matches_phrase(cur, adjacent, needle), f"adjacent {needle!r}"
+        assert not matches_phrase(cur, apart, needle), f"non-adjacent {needle!r}"
+
+    def test_orban_accent_policy_is_one_way(self, cur):
+        # Typing the accent narrows; typing without it does not.
+        assert not matches_phrase(cur, "Ludovic Orban Romaniaban", "Orbán")
+        assert matches_phrase(cur, "Orbán Viktor Brüsszelben tárgyalt", "Orban")
+
+    def test_orbannak_reaches_the_base_form(self, cur):
+        assert matches_phrase(cur, "Orbánnak üzent a miniszter", "Orbán")
+
+    def test_magyarorszagrol_case_suffix(self, cur):
+        assert matches(cur, "Magyarországról érkezett a hír", "Magyarországról")
+        assert matches(cur, "Magyarországról érkezett a hír", "Magyarorszagrol")
+
+    def test_europai_unio_is_a_phrase(self, cur):
+        assert matches_phrase(cur, "az Európai Unió döntése", "Európai Unió")
+        assert not matches_phrase(cur, "az Unió és az Európai Tanács",
+                                  "Európai Unió")
+
+    def test_kor_and_kór_stay_apart(self, cur):
+        assert not matches_phrase(cur, "a kor jo volt", "kór")
+        assert matches_phrase(cur, "a kór terjedt", "kór")
+        # ...but the accent-free spelling still reaches both, by design.
+        assert matches_phrase(cur, "a kór terjedt", "kor")
+
+
+class TestTokenisationSemantics:
+    """Hyphens and compounds - PINNED DELIBERATELY, not inherited.
+
+    These assertions encode a product decision, so that Postgres's parser cannot
+    change the product's meaning by accident. They record what the engine does
+    TODAY. If the team decides a dash variant should be interchangeable, or that
+    a phrase should be findable inside a compound, these are the tests to change
+    first - and their failure is then the signal that the decision was acted on,
+    not a regression.
+
+    Measured on the evaluation corpus: treating every dash variant as
+    interchangeable would recover 17 further true positives out of 878 across a
+    120-phrase probe set (roughly 1.9%).
+    """
+
+    def test_a_hyphenated_compound_matches_its_own_spelling(self, cur):
+        assert matches_phrase(cur, "az orosz-ukrán háború kitört",
+                              "orosz-ukrán háború")
+
+    def test_an_en_dash_is_currently_NOT_the_same_as_a_hyphen(self, cur):
+        """CURRENT BEHAVIOUR, and a decision the team may reverse.
+
+        'orosz–ukrán' (U+2013) and 'orosz-ukrán' (U+002D) tokenise differently:
+        the hyphen produces a compound plus its parts, the en dash produces only
+        the parts. A Hungarian newsroom uses both typographies for one word.
+        """
+        assert not matches_phrase(cur, "az orosz–ukrán háború kitört",
+                                  "orosz-ukrán háború")
+
+    def test_a_phrase_is_currently_NOT_found_inside_a_compound(self, cur):
+        """CURRENT BEHAVIOUR, and a decision the team may reverse.
+
+        'Orbán Viktor-fóbia' tokenises 'Viktor-fóbia' as a compound, so the
+        phrase 'Orbán Viktor' does not occur inside it.
+        """
+        assert not matches_phrase(
+            cur, "Már megint elhatalmasodott rajtad az Orbán Viktor-fóbia!!",
+            "Orbán Viktor")
+
+
+class TestAccentFreeStopwordPhrase:
+    """The shape 021 broke and 022 fixed: accent-free needle, edge stopword,
+    accented text.
+
+        phrase_match('a felek között van a vita', 'kozott van')
+
+    Under 021 every branch declined it, each for a locally correct reason: the
+    lemma branch was edge-guarded because 'van' is a stopword there;
+    hungarian_surface stopwords 'van' too, so the folded branch was edge-guarded
+    as well; and `simple` preserves accents, so 'kozott' could not reach
+    'között'. 022 gives the folded branch a configuration with no stopword list -
+    `simple` over accent-folded text - which can never lose an edge token.
+
+    Found only by running the full chain against a reference computed outside
+    Postgres. The weaker property this suite asserted before - candidate filter
+    superset-of phrase_match - held throughout, because a wrong exact layer sits
+    inside a broad filter without complaint.
+    """
+
+    @pytest.mark.parametrize("haystack,needle", [
+        ("a felek között van a vita",     "kozott van"),
+        ("mindenki számára elérhető",     "mindenki szamara"),
+        ("a döntés szerint egyre több",   "szerint egyre"),
+        ("az apja által vezetett cég",    "apja altal"),
+    ])
+    def test_an_accent_free_needle_crosses_a_stopword(self, cur, haystack, needle):
+        assert matches_phrase(cur, haystack, needle)
+
+    @pytest.mark.parametrize("haystack,needle", [
+        ("a felek döntöttek. Van egy másik vita is.", "kozott van"),
+        ("A kormany dontott. Nem mondott arrol semmit.", "kormany arrol"),
+    ])
+    def test_but_it_is_still_a_phrase(self, cur, haystack, needle):
+        """Reach must not cost adjacency - that was 021's whole point."""
+        assert not matches_phrase(cur, haystack, needle)
+
+    def test_an_accented_slash_token_is_no_longer_torn_apart(self, cur):
+        """A second defect 022 closes by construction.
+
+        hungarian_surface unaccents as a dictionary, i.e. AFTER parsing, so an
+        accent inside a slash-joined token split it:
+        'MTI/Miniszterelnöki' became 'mti/minisztereln' + 'oki'. Folding first
+        and parsing ASCII does not.
+        """
+        assert matches_phrase(cur, "Fotó: MTI/Miniszterelnöki Sajtóiroda",
+                              "mti/miniszterelnoki sajtoiroda")
