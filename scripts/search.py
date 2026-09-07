@@ -467,7 +467,8 @@ def _blocks_for_terms(cur, article_id: int, query: str, limit: int) -> list[dict
     return rows[:limit]
 
 
-def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = None,
+def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
+                    outlet: str | None = None,
                     tag: str | None = None, blocks_per_article: int = 3,
                     author: str | None = None, section: str | None = None,
                     date_from: str | None = None, date_to: str | None = None,
@@ -587,8 +588,9 @@ def search_articles(cur, query: str, *, limit: int = 10, outlet: str | None = No
                  -- a result list is in unspecified order and a harness that
                  -- diffs two runs reports changes that are not changes.
                  a.id
-        LIMIT %(limit)s
+        LIMIT %(limit)s OFFSET %(offset)s
     """, {"query": query, "outlet": outlet, "tag": tag, "limit": limit,
+          "offset": offset,
           "author": author, "section": section, "phrase": phrase,
           "date_from": date_from, "date_to": date_to})
 
@@ -655,6 +657,7 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
 
 
 def search_article_content(cur, query: str, *, limit: int = 20,
+                           offset: int = 0,
                            phrase: bool = False) -> list[dict]:
     """Block-level search: the citable unit, straight out."""
     require_supported_syntax(query)
@@ -669,9 +672,14 @@ def search_article_content(cur, query: str, *, limit: int = 20,
         WHERE b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
           AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
-        ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index
-        LIMIT %(limit)s
-    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit, "phrase": phrase})
+        -- b.id is the deterministic last resort, for the same reason
+        -- search_articles carries a.id: without it two blocks on one rank are
+        -- in unspecified order, and OFFSET would then be able to skip a row or
+        -- return it twice across pages.
+        ORDER BY rank DESC, a.published_at DESC NULLS LAST, b.block_index, b.id
+        LIMIT %(limit)s OFFSET %(offset)s
+    """, {"q": query, "opts": HEADLINE_OPTS, "limit": limit, "offset": offset,
+          "phrase": phrase})
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -742,6 +750,12 @@ def main(argv: list[str]) -> int:
                         metavar="YYYY-MM-DD",
                         help="published on or before (inclusive of that day)")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--offset", type=int, default=0,
+                        help="skip this many results - page 2 of a --limit 10 "
+                             "search is --offset 10")
+    parser.add_argument("--blocks-per-article", type=int, default=3,
+                        dest="blocks_per_article", metavar="N",
+                        help="matching passages to attach to each article")
     parser.add_argument("--phrase", action="store_true",
                         help="require the query as an adjacent word sequence, "
                              "not as a bag of words")
@@ -829,6 +843,7 @@ def main(argv: list[str]) -> int:
                       f"{row['title']}")
         elif args.blocks:
             rows = search_article_content(cur, args.query, limit=args.limit,
+                                          offset=args.offset,
                                           phrase=args.phrase)
             kind = "phrase" if args.phrase else "block"
             print(f"== {kind} search {args.query!r}: {len(rows)} block(s)")
@@ -839,6 +854,8 @@ def main(argv: list[str]) -> int:
                 print(f"   {row['xpath']}")
         else:
             rows = search_articles(cur, args.query, limit=args.limit,
+                                   offset=args.offset,
+                                   blocks_per_article=args.blocks_per_article,
                                    outlet=args.outlet, tag=args.tag,
                                    author=args.author, section=args.section,
                                    date_from=args.date_from,
