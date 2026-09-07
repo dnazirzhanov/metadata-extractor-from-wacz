@@ -1,0 +1,134 @@
+# Continuous integration.
+#
+# Search was frozen on 2026-09-07 on the strength of 95 automated tests. A
+# freeze guarded only by someone remembering to type `pytest` is not a freeze,
+# which is what this file is for.
+#
+# Three jobs, deliberately separate so a failure says WHERE it broke rather than
+# just THAT it broke:
+#
+#   unit        the extractor, no database, no services. The floor.
+#   migrations  every migration applied from scratch, twice, then rolled back.
+#               Each carries a DO $verify$ block that aborts its own transaction
+#               on failure, so this runs 22 self-checks nobody has to maintain.
+#   search      the corpus schema on a real Postgres, then the search suite.
+#
+# The search job needs NO ingested corpus. 84 of its assertions build their own
+# document inline - corpus.search_vector('literal') against
+# corpus.search_query('query') - so they hold on an empty schema; the 11 that
+# genuinely need articles skip themselves cleanly. That is what makes this
+# runnable on a fresh container in under a second rather than needing a fixture
+# corpus committed to the repository.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  unit:
+    name: extractor (no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Test
+        # No CX_TEST_DSN, so the search module skips itself and this job stays
+        # a pure check that the package works on a fresh checkout - the same
+        # contract test_integration.py uses for its archive directory.
+        run: pytest -q
+
+  migrations:
+    name: migrations from scratch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply every migration twice, then prove the rollback
+        # The repo's own harness. It creates and destroys its own throwaway
+        # container, applies all migrations from scratch, applies them AGAIN to
+        # prove idempotency, then drops the corpus schema and checks the
+        # crawler stand-in tables survive. Every DO $verify$ block runs here.
+        run: scripts/validate_migrations.sh
+
+  search:
+    name: corpus schema + search suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: causalia
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: causalia
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U causalia -d causalia"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: causalia
+      PGPASSWORD: ci
+      PGDATABASE: causalia
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e '.[dev,db]'
+
+      - name: Install psql client
+        # scripts/migrate.sh runs `psql -f <path>`, so psql has to see the
+        # repository on its own filesystem. On the runner it does.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Crawler stand-in tables
+        # corpus.article has one outbound FK, to urls(url_hash), and migration
+        # 002 fails outright without it. scripts/standin_crawler.sql is the
+        # canonical minimal stand-in - the constraint is EXERCISED here, not
+        # avoided.
+        run: psql -v ON_ERROR_STOP=1 -q -f scripts/standin_crawler.sql
+
+      - name: Apply migrations
+        run: scripts/migrate.sh
+
+      - name: Apply again (idempotency)
+        # A migration that is not a no-op the second time is a migration that
+        # cannot be re-run against a live database.
+        run: scripts/migrate.sh
+
+      - name: Migration ledger
+        run: scripts/migrate.sh --status
+
+      - name: Search suite
+        env:
+          CX_TEST_DSN: host=127.0.0.1 port=5432 user=causalia password=ci dbname=causalia
+        run: pytest -q -rs
