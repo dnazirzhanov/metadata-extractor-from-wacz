@@ -12,6 +12,18 @@ Plain, idempotent SQL. Design and rationale: [../docs/postgres-schema.md](../doc
 | `006_indexes.sql` | 24 indexes — 15 query, 9 FK-maintenance |
 | `007_search_recall.sql` | `hungarian_lemma` + `hungarian_surface` configs, `unaccent_immutable`, `search_vector`, `search_query`; rebuilds both search vectors |
 | `008_caption_search.sql` | `article_image.caption_tsv` — image captions, alt text and credits become searchable (discoverable, not citable) |
+| `009_search_filters.sql` | `corpus.phrase_match` (adjacency recheck), GIN index on `authors` for the exact byline filter |
+| `010_search_query_lemma_guard.sql` | drops invented 1–2 character lemmas from a query — `Orban` was over-stemming to `or`, a lexeme matching 14% of the corpus |
+| `011_search_query_whitespace.sql` | `corpus.whitespace_chars`, `corpus.collapse_whitespace`; query terms split on the same 30-codepoint class the extractor uses |
+| `012_search_terms.sql` | `corpus.search_terms`, `corpus.term_query`; a multi-word query no longer needs every term in ONE vector — `search_query` becomes the AND-fold of the per-term function |
+| `013_compound_terms.sql` | hyphenated compounds are one term, not two — `európa-bajnokság` was satisfied by either half |
+| `014_phrase_match_lemma_guard.sql` | `corpus.lemma_phrase_safe`; `phrase_match` had bypassed 010's guard and matched `orra` (a nose) for `Orban` |
+| `015_compound_prefix.sql` | `corpus.prefix_min_length` (7); a closed Hungarian compound answers its head word via a surface prefix |
+| `016_accented_lemma.sql` | a third `search_vector` component: the accent-**preserving** lemma. Rebuilds every vector and index |
+| `017_accent_sensitive_query.sql` | `corpus.accented_lexemes`, `corpus.accented_query`; typing the accent narrows — `kór` stops matching `kor`. One-way: typing without it still does not |
+| `018_accented_surface.sql` | `corpus.accented_raw_lexemes`; fixes the split paradigm 017 caused — `párt` had stopped finding `pártok` |
+| `019_unaccented_case_suffix.sql` | `corpus.restorable_case_suffixes`, `corpus.reaccented_lemmas`; an accent-free case suffix still stems — `kormanyrol` reached 0 articles where `kormányról` reached 94 |
+| `020_accented_stopword_fallback.sql` | an accented stopword falls back to its folded surface form — `arról` reached 0 where `arrol` reached 208, and one such word made a whole multi-term query unsatisfiable |
 
 ## What these do and do not touch
 
@@ -75,7 +87,32 @@ scripts/validate_ingestion.sh <dir>     # ingest real output, assert invariants
 `validate_ingestion.sh` takes a directory of extractor output — the same thing
 `causalia-extractor extract --output` produces. It ingests every article, checks
 the extractor's guarantees still hold once the data is in Postgres, then ingests
-everything again to exercise re-extraction. Last run: **907 checks, all passing.**
+everything again to exercise re-extraction.
+
+The check count these harnesses print is a **running counter that increments per
+article**, not a fixed number of assertions — roughly 63 per article, so the same
+harness reports 907 on one corpus and 64,022 over 1,008 articles. Read it as
+"this much was validated", never as a suite size.
+
+### Self-checks
+
+Every migration carries a `DO $verify$` block that runs **inside its own
+transaction**, so a database that cannot satisfy the assertions refuses to be
+built. They test SQL functions against literal fixtures, which means they need
+no ingested corpus — and also means they never reach the Python in
+`scripts/search.py`. That layer is covered by `tests/test_search_db.py`, which
+skips unless `CX_TEST_DSN` names a migrated database.
+
+A verify block can only assert what is true **at its own migration**. 010's lemma
+guard, 015's prefix threshold and 017's accent sensitivity all change these
+answers later, so an assertion written into an earlier file must not depend on
+them. 009 deliberately does not pin the `orra`/`Orban` collision: that defect was
+live at 009 and was not closed until 014.
+
+`migrate.sh` skips any version already in the ledger, so these blocks gate a
+**fresh** database. `validate_migrations.sh` applies everything from scratch on
+every run, which is what makes them a repeatable gate rather than a one-time
+one.
 
 ## If you change how search works
 
