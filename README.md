@@ -205,8 +205,12 @@ than hides.
 The database listens on loopback on milab2, so open a tunnel first:
 
 ```bash
-ssh -N -L 55435:127.0.0.1:55435 c0cshf@10.1.12.63
+ssh -N -L 55435:127.0.0.1:55435 "$MILAB2"
 ```
+
+`$MILAB2` is the archiver host's `user@host`. It is deliberately not written
+down in this repository — see the deployment notes — for the same reason
+`migrations/README.md` and `scripts/migrate.sh` use the variable.
 
 Then point a PostgreSQL data source at `127.0.0.1:55435`, database
 `causalia_eval`, user `causalia`, password `eval`. In IntelliJ or DataGrip open
