@@ -33,7 +33,8 @@ from pathlib import Path
 from . import __version__
 from .identity import PAGES_ROOT, iter_wacz_files
 from .output import ArchiveMutated, UnsafeArtifact
-from .pipeline import STATUS_FAILED, extract
+from .pipeline import (ALL_STAGES, STAGE_CONTENT, STAGE_SCREENSHOT,
+                       STATUS_FAILED, extract, extract_screenshot)
 
 log = logging.getLogger("causalia_extractor")
 
@@ -62,6 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--copy-wacz", action="store_true",
                      help="copy page.wacz into the output dir (off by default: "
                           "the corpus is ~30 TB and the source path is recorded)")
+    run.add_argument("--stages", default=",".join(ALL_STAGES), metavar="LIST",
+                     help="comma-separated stages to run (default: %(default)s). "
+                          "`content` alone writes no screenshot and is ~1.48x "
+                          "faster; `screenshot` alone backfills one without "
+                          "re-reading the article")
+    run.add_argument("--force", action="store_true",
+                     help="sweep this extractor's own prior artifacts before "
+                          "re-extracting (never touches a screenshot or anything "
+                          "outside the artifact allowlist)")
     run.add_argument("--dry-run", action="store_true",
                      help="run the full pipeline and every safety check, write nothing")
     run.add_argument("--log-level", default="INFO",
@@ -105,6 +115,19 @@ def _print_summary(results) -> None:
         print("  FAILED %s\n         %s" % (result.wacz_path, result.error))
 
 
+def _screenshot_only(args, archives) -> int:
+    """--stages screenshot: the backfill pass, reported on its own terms."""
+    counts = Counter()
+    for wacz_path in archives:
+        result = extract_screenshot(wacz_path, args.output, dry_run=args.dry_run)
+        counts[result.state] += 1
+        log.info("%-16s %s", result.state, result.output_dir or result.wacz_path)
+    print("\n%d archive(s) processed" % sum(counts.values()))
+    for state, count in sorted(counts.items()):
+        print("  %-16s %d" % (state, count))
+    return 1 if counts.get("failed") else 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -118,13 +141,32 @@ def main(argv=None) -> int:
     if args.limit:
         archives = itertools.islice(archives, args.limit)
 
+    stages = tuple(part.strip() for part in args.stages.split(",") if part.strip())
+    unknown = [stage for stage in stages if stage not in ALL_STAGES]
+    if unknown:
+        print("unknown stage(s): %s (known: %s)" % (", ".join(unknown),
+                                                    ", ".join(ALL_STAGES)),
+              file=sys.stderr)
+        return 2
+    if not stages:
+        print("no stages selected", file=sys.stderr)
+        return 2
+
+    # SCREENSHOT ALONE IS A DIFFERENT JOB, not a narrower extraction: it reads
+    # the archive without buffering media, writes one file, and deliberately
+    # leaves extraction.json alone so the content extraction's manifest keeps
+    # describing the content extraction.
+    if stages == (STAGE_SCREENSHOT,):
+        return _screenshot_only(args, archives)
+
     log.info("extracting into %s", args.output)
     results = []
     try:
         for wacz_path in archives:
             try:
                 result = extract(wacz_path, args.output, dry_run=args.dry_run,
-                                 copy_wacz=args.copy_wacz)
+                                 copy_wacz=args.copy_wacz, force=args.force,
+                                 stages=stages)
             except (ArchiveMutated, UnsafeArtifact) as exc:
                 # Both mean the run cannot be trusted to continue.
                 print("FATAL %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
