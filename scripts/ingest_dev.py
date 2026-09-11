@@ -23,7 +23,7 @@ from pathlib import Path
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cx_ingest import ingest                                   # noqa: E402
+from cx_ingest import ingest, load, seed_crawler_rows          # noqa: E402
 import search                                                  # noqa: E402
 
 DEFAULT_DSN = ("host=127.0.0.1 port=55433 user=causalia password=dev "
@@ -81,7 +81,15 @@ def main(argv: list[str]) -> int:
         try:
             with connection:                       # one transaction per article
                 with connection.cursor() as cur:
-                    _article_id, _extraction_id, synthetic = ingest(cur, directory)
+                    # The DEV database has no crawler rows, so this
+                    # harness creates them itself. Production ingestion looks
+                    # the capture up and refuses when there is none - see
+                    # cx_ingest.resolve_capture.
+                    capture = seed_crawler_rows(
+                        cur, directory, load(directory, "article.json"),
+                        confirm_development=True)
+                    _article_id, _extraction_id, synthetic = ingest(
+                        cur, directory, capture=capture)
                     skipped += synthetic
         except Exception as exc:                   # noqa: BLE001 - report, continue
             failures += 1

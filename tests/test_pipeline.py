@@ -40,11 +40,29 @@ class TestOutputSet:
 
 
 class TestLifecycle:
-    def test_extraction_json_holds_exactly_three_fields(self, tmp_path):
+    def test_extraction_json_is_the_commit_marker(self, tmp_path):
+        """The three original fields, plus the verdict and the manifest.
+
+        It grew from three fields to six for two reasons, both of which are
+        about what a CONSUMER can check without re-deriving it:
+        `quality`/`quality_reasons` state whether the article may be ingested,
+        and `artifacts` lists what must exist beside this file, which is what
+        turns "the directory is present" into "the directory is complete".
+        """
         directory = extract(simple_wacz(tmp_path), tmp_path / "out").output_dir
         payload = load(directory, "extraction.json")
         assert set(payload) == {"extraction_version", "extracted_at",
-                                "extraction_status"}
+                                "extraction_status", "quality",
+                                "quality_reasons", "artifacts", "error"}
+
+    def test_the_manifest_lists_artifacts_that_are_all_present(self, tmp_path):
+        directory = extract(simple_wacz(tmp_path), tmp_path / "out").output_dir
+        manifest = load(directory, "extraction.json")["artifacts"]
+        assert manifest, "a successful extraction writes artifacts"
+        assert "extraction.json" not in manifest, (
+            "the marker does not list itself - it is the proof the rest landed")
+        for name in manifest:
+            assert (directory / name).is_file(), name
 
     def test_none_of_the_old_diagnostics_are_persisted(self, tmp_path):
         directory = extract(simple_wacz(tmp_path), tmp_path / "out").output_dir
@@ -56,13 +74,74 @@ class TestLifecycle:
     def test_a_good_article_is_success(self, tmp_path):
         assert extract(simple_wacz(tmp_path), tmp_path / "out").status == "success"
 
-    def test_an_article_with_no_blocks_is_partial_not_failed(self, tmp_path):
+    def test_an_article_with_no_blocks_is_invalid_not_partial(self, tmp_path):
+        """REVERSED DELIBERATELY on 2026-09-11. This used to assert `partial`.
+
+        `partial` meant the article was ingested, got an article row whose
+        search_tsv is built from title/subtitle/description/tags, and answered
+        queries - with no content block, so no citable passage. That is the one
+        thing this corpus exists to prevent. Measured on mandiner: 1.28% of the
+        outlet, ~5,400 articles, and 8 of 600 in the chain-of-custody sample.
+
+        Nothing is destroyed by the reversal: the .wacz is untouched, the
+        verdict is recorded, and a later extractor version can re-run it.
+        """
         wacz = make_wacz(tmp_path / "page.wacz", records=[
             {"uri": ARTICLE_URL, "content_type": "text/html",
              "body": html_document("<div></div>")}])
         result = extract(wacz, tmp_path / "out")
-        assert result.status == "partial"
+        assert result.status == "failed"
+        assert result.quality == "invalid"
+        assert result.verdict.reasons == ["no_content_blocks"]
+        assert not result.verdict.usable
         assert any("no article content blocks" in w for w in result.warnings)
+
+    def test_an_image_only_article_has_no_citable_text_and_is_invalid(self, tmp_path):
+        """Image and video blocks are real blocks that hold no text.
+
+        Counting them as content is what let an empty article look populated,
+        so the contract counts PROSE blocks, not blocks.
+        """
+        wacz = make_wacz(tmp_path / "page.wacz", records=[
+            {"uri": ARTICLE_URL, "content_type": "text/html",
+             "body": html_document(
+                 '<figure><img src="https://example.hu/a.jpg" alt="x"></figure>')}])
+        result = extract(wacz, tmp_path / "out")
+        assert result.quality == "invalid"
+        assert result.verdict.reasons == ["no_content_blocks"]
+
+    def test_a_failure_is_recorded_on_disk_when_identity_is_known(self, tmp_path):
+        """A corrupt archive used to leave NOTHING behind - not even a log row.
+
+        Every failure path returns no output directory, so extraction_status
+        `failed` could not be written by any producer and a re-run repeated the
+        same failure forever. When the archive sits in the corpus layout its
+        identity is known from the path, so the marker is written where the
+        article would have lived.
+        """
+        article_dir = tmp_path / "corpus" / "metropol.hu" / "ab" / ("ab" + "f" * 62)
+        article_dir.mkdir(parents=True)
+        broken = article_dir / "page.wacz"
+        broken.write_bytes(b"not a zip at all")
+
+        result = extract(broken, tmp_path / "out")
+
+        assert result.status == "failed"
+        assert result.marker_dir is not None
+        payload = load(result.marker_dir, "extraction.json")
+        assert payload["quality"] == "invalid"
+        assert payload["quality_reasons"] == ["archive_unreadable"]
+        assert payload["artifacts"] == []
+        assert payload["error"]
+
+    def test_a_failure_outside_the_corpus_layout_writes_nothing(self, tmp_path):
+        """No identity, no place to put a marker - and no directory invented."""
+        broken = tmp_path / "broken.wacz"
+        broken.write_bytes(b"not a zip at all")
+        result = extract(broken, tmp_path / "out")
+        assert result.status == "failed"
+        assert result.marker_dir is None
+        assert not (tmp_path / "out").exists()
 
     def test_an_unreadable_archive_is_failed_and_reported(self, tmp_path):
         broken = tmp_path / "broken.wacz"
@@ -222,3 +301,42 @@ class TestCli:
     def test_the_output_path_is_required(self, tmp_path):
         with pytest.raises(SystemExit):
             main(["extract", "--input", str(tmp_path)])
+
+
+class TestForceSweep:
+    """--force exists now. It did not: output.py documented the sweep as "used
+    only by --force" and cli.py had no such flag, so the function was
+    unreachable and every re-extraction left the previous reading's artifacts
+    beside the new ones."""
+
+    def test_force_removes_a_stale_artifact_from_a_previous_reading(self, tmp_path):
+        wacz = simple_wacz(tmp_path)
+        directory = extract(wacz, tmp_path / "out").output_dir
+        stale = directory / "images" / "image_009.jpg"
+        stale.parent.mkdir(exist_ok=True)
+        stale.write_bytes(b"from an older reading")
+
+        extract(wacz, tmp_path / "out", force=True)
+        assert not stale.exists()
+
+    def test_force_never_deletes_a_screenshot(self, tmp_path):
+        """The invariant the whole screenshot architecture rests on. It holds
+        because screenshot.* is not in ARTIFACT_FILES, and this is the test that
+        keeps it true."""
+        wacz = simple_wacz(tmp_path)
+        directory = extract(wacz, tmp_path / "out").output_dir
+        shot = directory / "screenshot.webp"
+        shot.write_bytes(b"a screenshot from an earlier pass")
+
+        extract(wacz, tmp_path / "out", force=True)
+        assert shot.read_bytes() == b"a screenshot from an earlier pass"
+
+    def test_force_leaves_files_this_extractor_did_not_write(self, tmp_path):
+        wacz = simple_wacz(tmp_path)
+        directory = extract(wacz, tmp_path / "out").output_dir
+        foreign = directory / "videos" / "reviewed-by-hand.mp4"
+        foreign.parent.mkdir(exist_ok=True)
+        foreign.write_bytes(b"cost a network fetch to obtain")
+
+        extract(wacz, tmp_path / "out", force=True)
+        assert foreign.exists()

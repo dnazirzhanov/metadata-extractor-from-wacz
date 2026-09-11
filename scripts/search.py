@@ -159,19 +159,28 @@ CANDIDATES = """
             FROM q,
                  unnest(q.terms) WITH ORDINALITY AS t(tsq, ord),
                  LATERAL (
+                     -- Every branch goes through corpus.searchable_article
+                     -- (migration 026). The block and caption branches were
+                     -- already scoped to the current extraction; THE METADATA
+                     -- BRANCH WAS NOT, and that was the hole: an article whose
+                     -- current reading is `failed`, or which produced no prose
+                     -- block at all, still matched on its title, subtitle,
+                     -- description, authors and tags, and answered a search
+                     -- with no citable passage behind it.
                      SELECT a2.id AS article_id
                        FROM corpus.article a2
+                       JOIN corpus.searchable_article sa ON sa.id = a2.id
                       WHERE a2.search_tsv @@ t.tsq
                      UNION
                      SELECT b.article_id
                        FROM corpus.content_block b
-                       JOIN corpus.article a3 ON a3.id = b.article_id
+                       JOIN corpus.searchable_article a3 ON a3.id = b.article_id
                       WHERE b.extraction_id = a3.current_extraction_id
                         AND b.text_tsv @@ t.tsq
                      UNION
                      SELECT i.article_id
                        FROM corpus.article_image i
-                       JOIN corpus.article a4 ON a4.id = i.article_id
+                       JOIN corpus.searchable_article a4 ON a4.id = i.article_id
                       WHERE i.extraction_id = a4.current_extraction_id
                         AND i.caption_tsv @@ t.tsq
                  ) m
@@ -522,6 +531,9 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                tr.term_rank,
                ar.accent_rank
         FROM corpus.article a
+        -- The searchability gate, enforced in the schema rather than in a
+        -- WHERE clause someone has to remember to write. See migrations/026.
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
         CROSS JOIN LATERAL (
@@ -648,6 +660,7 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
         WITH {CANDIDATES}
         SELECT a.id
         FROM corpus.article a
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         CROSS JOIN q
         WHERE {MATCH_WHERE}
     """, {"query": query, "outlet": outlet, "tag": tag, "author": author,
@@ -669,6 +682,7 @@ def search_article_content(cur, query: str, *, limit: int = 20,
                            {QUERY}(%(q)s), %(opts)s) AS headline
         FROM corpus.content_block b
         JOIN corpus.article a ON a.id = b.article_id
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         WHERE b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
           AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
@@ -691,10 +705,12 @@ def filter_by_tag(cur, tag: str, *, limit: int = 50) -> list[dict]:
     prose, which is the wrong answer for a filter (docs/postgres-schema.md D.3).
     """
     cur.execute("""
-        SELECT id, url_hash, title, outlet, published_at, canonical_url, tags
-        FROM corpus.article
-        WHERE tags @> ARRAY[%(tag)s]::text[]
-        ORDER BY published_at DESC NULLS LAST
+        SELECT a.id, a.url_hash, a.title, a.outlet, a.published_at,
+               a.canonical_url, a.tags
+        FROM corpus.article a
+        JOIN corpus.searchable_article sa ON sa.id = a.id
+        WHERE a.tags @> ARRAY[%(tag)s]::text[]
+        ORDER BY a.published_at DESC NULLS LAST
         LIMIT %(limit)s
     """, {"tag": tag, "limit": limit})
     return [dict(row) for row in cur.fetchall()]

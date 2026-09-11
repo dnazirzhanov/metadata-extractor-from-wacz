@@ -46,7 +46,10 @@ CREATE TABLE archives (
     status TEXT NOT NULL DEFAULT 'in_progress'
            CHECK (status IN ('in_progress','success','failed')),
     wacz_path TEXT, wacz_sha256 TEXT, wacz_size_bytes BIGINT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The production ingestion path reads both of these; see standin_crawler.sql.
+    finished_at TIMESTAMPTZ,
+    doc_http_status TEXT
 );
 CREATE TABLE videos (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
 CREATE TABLE schema_migrations (version TEXT PRIMARY KEY,

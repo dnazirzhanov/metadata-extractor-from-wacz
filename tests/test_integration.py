@@ -57,11 +57,33 @@ def load(directory, name):
 
 
 class TestItRuns:
-    def test_every_real_capture_is_processed_without_failing(self, extracted):
+    def test_no_real_capture_makes_the_extractor_crash(self, extracted):
+        """A CRASH is a defect. A quality verdict is not.
+
+        Since the quality contract landed, `failed` carries both meanings, so
+        this test asks the question it always meant to ask: did anything blow
+        up? An archive that simply holds no article prose is an `invalid`
+        verdict with no error, and the test set contains one real example
+        (metropol.hu 616c26f9..., 0 blocks / 0 words) that used to be recorded
+        as `partial` and ingested.
+        """
         _, results = extracted
-        failed = [(r.wacz_path.name, r.error) for r in results
-                  if r.status == "failed"]
-        assert not failed, failed
+        crashed = [(r.wacz_path.name, r.error) for r in results if r.error]
+        assert not crashed, crashed
+
+    def test_every_real_capture_gets_a_verdict(self, extracted):
+        _, results = extracted
+        assert all(r.verdict is not None for r in results)
+        assert all(r.verdict.quality in ("success", "partial_valid", "invalid")
+                   for r in results)
+
+    def test_the_test_set_is_overwhelmingly_usable(self, extracted):
+        """A contract that rejects real articles in bulk is a defect in itself."""
+        _, results = extracted
+        usable = [r for r in results if r.verdict.usable]
+        assert len(usable) >= len(results) - 1, [
+            (r.wacz_path.parent.name[:12], r.verdict.reasons)
+            for r in results if not r.verdict.usable]
 
     def test_every_article_produces_the_full_artifact_set(self, extracted):
         output, _ = extracted
