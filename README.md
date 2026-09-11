@@ -77,6 +77,78 @@ double it. Pass `--copy-wacz` if you want it beside the artifacts.
 
 See [docs/data-contract.md](docs/data-contract.md) for every field.
 
+## Production ingestion
+
+The CLI above extracts a tree and is right for a handful of archives. A corpus
+run needs a frontier that survives being interrupted, which is what `ingest/`
+adds: the work ledger (`corpus.extraction_task`), a resumable extraction worker,
+and a batched loader that refuses anything the quality contract rejected.
+
+```bash
+export CX_INGEST_DSN="host=... dbname=..."
+
+# 1. queue an outlet. Excludes non-2xx captures and archives over 100 MB;
+#    both get their own pass.
+python -c "import os, psycopg2; from ingest import ledger; \
+    print(ledger.seed(psycopg2.connect(os.environ['CX_INGEST_DSN']), \
+    outlet='mandiner.hu', extractor_version='causalia-article-extractor/2.0.0'))"
+
+# 2. extract. N processes against one ledger; the claim is what keeps them
+#    disjoint. SIGTERM releases claims immediately rather than waiting.
+python -m ingest.extract_worker --outlet mandiner.hu --output /path/to/out --limit 1000
+
+# 3. load. Batched commits with a SAVEPOINT per article. RUN SEVERAL: ingestion
+#    is round-trip-latency bound, not resource bound - a single loader leaves
+#    the box 96% idle with Postgres at 0.4 of one core, and four measured
+#    52.3 articles/s against 13.8. The claim keeps them disjoint.
+for i in 1 2 3 4; do
+    python -m ingest.load --outlet mandiner.hu --output /path/to/out --once &
+done; wait
+
+# 4. recovery, on cron: return tasks whose worker stopped beating, and sweep
+#    orphaned temp files.
+python -m ingest.reap --output /path/to/out
+```
+
+Three rules the ledger enforces, each of which used to be nobody's job:
+
+* **An article is never searchable before it is ingested.** The loader claims
+  only `success` / `partial_valid` extractions, so an unusable one has no row a
+  query can reach; migration 025's CHECK stops a `failed` reading being current;
+  migration 026's view is what `scripts/search.py` joins.
+* **An interrupted run resumes.** The frontier is a query, not a filesystem walk.
+* **A crashed worker's articles come back.** Liveness is a heartbeat, never the
+  age of a row — and a failure is retryable until `attempts` runs out, after
+  which the task is `quarantined` and reported rather than retried forever.
+
+`extraction.json` is the commit marker: written last, after every other
+artifact, and carrying the manifest of what it committed. The loader accepts a
+directory only if the marker is there, its quality is usable, and every artifact
+it promises exists.
+
+### Screenshots, and running without them
+
+Screenshots are never removed from the architecture - they are switched off for
+a run and backfilled from the same archives afterwards. Measured on milab2:
+
+| | archives/s @8 workers | @20 workers | MB/article |
+| --- | --- | --- | --- |
+| `--stages content,screenshot` | 6.95 | 11.13 | 5.33 |
+| `--stages content` | 7.52 | 16.73 | ~0.50 |
+| `screenshot_worker` (backfill) | — | 39.99 | 4.79 |
+
+The gain from deferring is a WRITE-BANDWIDTH effect, so it only appears at
+concurrency high enough to saturate the disk: 1.08x at 8 workers, 1.50x at 20,
+where `Dirty` sits at the kernel's 10%-of-RAM writeback threshold. The backfill
+is cheap because `read_archive(html_only=True)` skips buffering the image and
+video bodies, not just parsing them.
+
+```bash
+python -m ingest.extract_worker --outlet mandiner.hu --output /path/to/out --stages content
+# ... later, from the same archives, creating no new reading of the article:
+python -m ingest.screenshot_worker --outlet mandiner.hu --output /path/to/out
+```
+
 ## The three mechanisms
 
 ### Text normalisation — `normalize.py`
