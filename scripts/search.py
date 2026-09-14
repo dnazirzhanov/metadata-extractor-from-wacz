@@ -183,6 +183,8 @@ CANDIDATES = """
                        JOIN corpus.searchable_article a4 ON a4.id = i.article_id
                       WHERE i.extraction_id = a4.current_extraction_id
                         AND i.caption_tsv @@ t.tsq
+                        -- the partial caption index's own predicate; an empty vector matches no term
+                        AND i.caption_tsv <> ''
                  ) m
             GROUP BY m.article_id
             HAVING count(DISTINCT t.ord) = (SELECT cardinality(terms) FROM q)
