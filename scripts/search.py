@@ -507,7 +507,16 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     """
     require_supported_syntax(query)
     cur.execute(f"""
-        WITH {CANDIDATES}
+        WITH {CANDIDATES},
+        -- The accented query of each term, computed ONCE per search. It depends
+        -- only on the query text, so evaluating corpus.accented_query() inside
+        -- the per-article accent LATERAL below repeated the same PL/pgSQL call
+        -- for every candidate (149,312 times for 'kormany' on the 413k corpus).
+        -- MATERIALIZED pins the single evaluation; ORDER BY ord keeps raw_terms
+        -- order, so the sum below adds the same values in the same order.
+        accent AS MATERIALIZED (
+            SELECT array_agg(corpus.accented_query(t.term) ORDER BY t.ord) AS tsqs
+            FROM q, unnest(q.raw_terms) WITH ORDINALITY AS t(term, ord))
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
@@ -567,8 +576,8 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             SELECT coalesce(sum(
                        ts_rank(to_tsvector('corpus.hungarian_lemma',
                                    concat_ws(' ', a.title, a.subtitle, a.description)),
-                               corpus.accented_query(t.term))), 0) AS accent_rank
-            FROM unnest(q.raw_terms) AS t(term)
+                               t.tsq)), 0) AS accent_rank
+            FROM accent, unnest(accent.tsqs) AS t(tsq)
         ) ar
         WHERE {MATCH_WHERE}
         ORDER BY (tr.term_rank
