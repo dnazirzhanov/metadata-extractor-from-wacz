@@ -549,19 +549,31 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             -- The BASE score: what each term is worth wherever it sits. Summed
             -- over terms, so an article scores even when no single vector holds
             -- the whole query - which is every article the 012 fix recovered.
-            SELECT coalesce(sum(
-                       ts_rank(a.search_tsv, t.tsq)
-                     + coalesce((SELECT max(ts_rank(b.text_tsv, t.tsq))
-                                   FROM corpus.content_block b
-                                  WHERE b.article_id = a.id
-                                    AND b.extraction_id = a.current_extraction_id
-                                    AND b.text_tsv @@ t.tsq), 0)
-                     + coalesce((SELECT max(ts_rank(i.caption_tsv, t.tsq))
-                                   FROM corpus.article_image i
-                                  WHERE i.article_id = a.id
-                                    AND i.extraction_id = a.current_extraction_id
-                                    AND i.caption_tsv @@ t.tsq), 0)), 0) AS term_rank
-            FROM unnest(q.terms) AS t(tsq)
+            --
+            -- The per-term block and caption probes run ONCE, in the subquery,
+            -- and the lone term's results are exposed as body_1/caption_1: for a
+            -- one-term query the concentration bonus in ORDER BY is the same
+            -- probe with the same tsquery, and it now reuses them instead of
+            -- scanning the article's blocks and captions a second time. OFFSET 0
+            -- keeps the planner from inlining the subquery, which would copy each
+            -- SubPlan into every aggregate that reads it. The sum adds the same
+            -- values in the same order as before.
+            SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0) AS term_rank,
+                   min(p.body)    AS body_1,
+                   min(p.caption) AS caption_1
+            FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
+                         (SELECT max(ts_rank(b.text_tsv, t.tsq))
+                            FROM corpus.content_block b
+                           WHERE b.article_id = a.id
+                             AND b.extraction_id = a.current_extraction_id
+                             AND b.text_tsv @@ t.tsq) AS body,
+                         (SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                            FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ t.tsq) AS caption
+                    FROM unnest(q.terms) AS t(tsq)
+                  OFFSET 0) p
         ) tr
         CROSS JOIN LATERAL (
             -- ACCENT BONUS. Rewards a document whose accents match the query's,
@@ -593,16 +605,20 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   -- 0.163-1.886, document-level hits 0.091-0.469, and they
                   -- interleave.
                   + ts_rank(a.search_tsv, q.tsq)
-                  + coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
-                                FROM corpus.content_block b
-                               WHERE b.article_id = a.id
-                                 AND b.extraction_id = a.current_extraction_id
-                                 AND b.text_tsv @@ q.tsq), 0)
-                  + coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
-                                FROM corpus.article_image i
-                               WHERE i.article_id = a.id
-                                 AND i.extraction_id = a.current_extraction_id
-                                 AND i.caption_tsv @@ q.tsq), 0)) DESC,
+                  -- One term: q.tsq IS that term's tsquery, so tr already holds
+                  -- these two probes. CASE runs the ELSE subquery only when taken.
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.body_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
+                                          FROM corpus.content_block b
+                                         WHERE b.article_id = a.id
+                                           AND b.extraction_id = a.current_extraction_id
+                                           AND b.text_tsv @@ q.tsq), 0) END
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.caption_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
+                                          FROM corpus.article_image i
+                                         WHERE i.article_id = a.id
+                                           AND i.extraction_id = a.current_extraction_id
+                                           AND i.caption_tsv @@ q.tsq), 0) END) DESC,
                  a.published_at DESC NULLS LAST,
                  -- Deterministic last resort. 'Magyarország' puts 82 articles
                  -- on one score and 63 on another, so without this the tail of
