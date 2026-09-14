@@ -520,6 +520,14 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
+               -- The complete match count, as a window over the same candidate
+               -- set this query already scores and sorts before LIMIT/OFFSET -
+               -- so a caller gets the total for free instead of matching_ids()
+               -- re-running the whole candidate search a second time just to
+               -- call len() on it. Only present when OFFSET landed inside the
+               -- match set; a caller past the end gets no rows and must fall
+               -- back to matching_ids() for the count. See service/app.py.
+               count(*) OVER ()                            AS total_matches,
                {META_HIT}                                  AS meta_match,
                ts_rank(a.search_tsv, q.tsq)                AS meta_rank,
                (SELECT max(ts_rank(b.text_tsv, q.tsq))
@@ -634,6 +642,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     results = []
     for row in cur.fetchall():
         hit = dict(row)
+        hit["total_matches"] = int(hit["total_matches"])
         hit["body_rank"] = float(hit["body_rank"] or 0.0)
         hit["meta_rank"] = float(hit["meta_rank"] or 0.0)
         hit["caption_rank"] = float(hit["caption_rank"] or 0.0)
