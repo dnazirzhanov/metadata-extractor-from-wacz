@@ -14,6 +14,7 @@ than as a plausible wrong answer.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -208,3 +209,53 @@ class TestRefusalIsPassedThrough:
 
     def test_a_missing_block_is_404(self, client):
         assert client.get("/blocks/99999999").status_code == 404
+
+
+@pytest.fixture(scope="module")
+def capture(client, populated):
+    """A real hit and its replay info; skips only where no captures are mounted."""
+    from causalia_extractor.identity import PAGES_ROOT
+    if not PAGES_ROOT.is_dir():
+        pytest.skip(f"no captures at {PAGES_ROOT} on this machine")
+    hits = client.get("/search", params={"q": "kormány", "limit": 1}).json()["hits"]
+    if not hits:
+        pytest.skip("no hit to replay in this corpus")
+    article_id = hits[0]["article"]["id"]
+    r = client.get(f"/articles/{article_id}/replay")
+    assert r.status_code == 200, r.text
+    return article_id, r.json()
+
+
+class TestArchiveReplay:
+    """A hit leads back to the capture it was extracted from, replayable as captured."""
+
+    def test_the_archive_endpoints_are_documented(self, client):
+        paths = client.get("/openapi.json").json()["paths"]
+        assert "/articles/{article_id}/replay" in paths
+        assert "/articles/{article_id}/page.wacz" in paths
+
+    def test_replay_info_is_in_the_form_the_player_needs(self, capture):
+        article_id, info = capture
+        assert re.fullmatch(r"\d{14}", info["ts"]), "replayweb.page fails silently on any other form"
+        assert info["wacz_url"] == f"/articles/{article_id}/page.wacz"
+        assert info["page_url"].startswith("http")
+        assert info["article"]["id"] == article_id
+
+    def test_the_capture_is_served_in_ranges(self, client, capture):
+        _, info = capture
+        r = client.get(info["wacz_url"], headers={"Range": "bytes=0-99"})
+        assert r.status_code == 206
+        assert r.headers["content-range"] == f"bytes 0-99/{info['wacz_bytes']}"
+        assert r.content[:2] == b"PK", "a .wacz is a zip"
+
+    def test_a_missing_article_has_no_capture(self, client):
+        assert client.get("/articles/99999999/replay").status_code == 404
+        assert client.get("/articles/99999999/page.wacz").status_code == 404
+
+
+class TestUI:
+    def test_the_search_page_and_its_script_are_served(self, client):
+        page = client.get("/")
+        assert page.status_code == 200
+        assert 'id="search-form"' in page.text
+        assert client.get("/static/app.js").status_code == 200

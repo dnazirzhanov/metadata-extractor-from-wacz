@@ -36,10 +36,17 @@ WHAT IT DELIBERATELY DOES NOT DO
 RUNNING IT
 ----------
     pip install -e '.[db,api]'
-    CX_API_DSN="host=127.0.0.1 port=55435 user=causalia password=eval dbname=causalia_eval" \\
-        uvicorn service.app:app --port 8000
+    CX_API_DSN="host=127.0.0.1 port=5432 user=causalia password=... dbname=causalia \\
+                options='-c default_transaction_read_only=on'" \\
+        uvicorn service.app:app --host 127.0.0.1 --port 8765
 
-    http://127.0.0.1:8000/docs      interactive OpenAPI
+    http://127.0.0.1:8765/          search UI; a result replays its archived .wacz
+    http://127.0.0.1:8765/docs      interactive OpenAPI
+
+Replay runs in a service worker, which browsers allow only on a secure origin, so
+open it as localhost - from another machine through `ssh -N -L 8765:127.0.0.1:8765`.
+CAUSALIA_PAGES_ROOT locates the captures; CX_REPLAY_ASSETS holds replayweb.page's
+ui.js and sw.js.
 """
 from __future__ import annotations
 
@@ -47,10 +54,13 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager, contextmanager
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # scripts/ is not an installed package - it is the database-facing tooling, and
@@ -62,8 +72,16 @@ import search as S                                              # noqa: E402
 import psycopg2.extras                                          # noqa: E402
 from psycopg2.pool import ThreadedConnectionPool                # noqa: E402
 
+from causalia_extractor.identity import PAGES_ROOT, WACZ_NAME  # noqa: E402
+
 DSN_ENV = "CX_API_DSN"
 _pool: ThreadedConnectionPool | None = None
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+#: replayweb.page's ui.js and sw.js: the copy the archive's own viewers already use.
+REPLAY_ASSETS = Path(os.environ.get("CX_REPLAY_ASSETS", "/mnt/hdd/c0cshf/causalia/pages/viewer"))
+#: Both parts are joined into a filesystem path, so they must have exactly these shapes.
+_URL_HASH = re.compile(r"[0-9a-f]{64}")
+_OUTLET = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 
 
 @asynccontextmanager
@@ -91,6 +109,15 @@ app = FastAPI(
             "to an exact passage in the archived page.",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# Same origin as the API and the captures, so the replay service worker can fetch both.
+# html=True: the player's frame opens /replay/?source=... and needs index.html before the worker controls it.
+app.mount("/replay", StaticFiles(directory=REPLAY_ASSETS, html=True, check_dir=False), name="replay")
+
+
+@app.get("/", include_in_schema=False)
+def ui():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @contextmanager
@@ -192,6 +219,15 @@ class Health(BaseModel):
     migration: str
     articles: int
     content_blocks: int
+
+
+class ReplayRef(BaseModel):
+    article: ArticleRef
+    wacz_url: str = Field(description="the article's original capture; answers Range requests")
+    page_url: str = Field(description="the URL to open inside the capture")
+    ts: str | None = Field(description="capture time as YYYYMMDDhhmmss, the form replayweb.page needs")
+    captured_at: str | None
+    wacz_bytes: int
 
 
 # ---------------------------------------------------------------------
@@ -329,6 +365,45 @@ def article(article_id: int, cur=Depends(_cur)):
     if row is None:
         raise HTTPException(404, f"no article {article_id}")
     return _article_ref(row)
+
+
+def _capture(cur, article_id: int) -> tuple[Any, Path]:
+    """The article row and its .wacz on this machine, or 404."""
+    cur.execute("""
+        SELECT id, url_hash, outlet, title, published_at, section, tags,
+               authors, source_url, canonical_url, captured_at
+          FROM corpus.article WHERE id = %s""", (article_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, f"no article {article_id}")
+    if not (_URL_HASH.fullmatch(row["url_hash"] or "") and _OUTLET.fullmatch(row["outlet"] or "")):
+        raise HTTPException(404, f"article {article_id} has no valid capture location")
+    path = PAGES_ROOT / row["outlet"] / row["url_hash"][:2] / row["url_hash"] / WACZ_NAME
+    if not path.is_file():
+        raise HTTPException(404, f"the capture of article {article_id} is not on this machine")
+    return row, path
+
+
+@app.get("/articles/{article_id}/replay", response_model=ReplayRef, tags=["archive"])
+def replay(article_id: int, cur=Depends(_cur)):
+    """What a WACZ player needs to show the article exactly as it was captured."""
+    row, path = _capture(cur, article_id)
+    captured = row["captured_at"].astimezone(timezone.utc) if row["captured_at"] else None
+    return ReplayRef(
+        article=_article_ref(row), wacz_url=f"/articles/{article_id}/page.wacz",
+        page_url=row["source_url"] or row["canonical_url"],
+        ts=captured.strftime("%Y%m%d%H%M%S") if captured else None,
+        captured_at=captured.isoformat() if captured else None,
+        wacz_bytes=path.stat().st_size)
+
+
+@app.api_route("/articles/{article_id}/page.wacz", methods=["GET", "HEAD"],
+               response_class=FileResponse, tags=["archive"])
+def wacz(article_id: int):
+    """The article's original capture, byte for byte; answers Range requests."""
+    with cursor() as cur:  # released before streaming: the player fetches many ranges at once
+        _, path = _capture(cur, article_id)
+    return FileResponse(path, media_type="application/wacz")
 
 
 @app.get("/articles/{article_id}/blocks", response_model=list[Passage],

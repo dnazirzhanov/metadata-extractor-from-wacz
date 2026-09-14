@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Causalia search</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <section id="search-view">
+    <header class="bar">
+      <a class="brand" href="/">Causalia</a>
+      <form id="search-form" role="search">
+        <input id="q" name="q" type="search" placeholder="Search the archive…" autocomplete="off" required>
+        <label class="toggle"><input id="phrase" name="phrase" type="checkbox"> exact phrase</label>
+        <button type="submit">Search</button>
+      </form>
+    </header>
+    <main>
+      <p id="status" class="status" aria-live="polite"></p>
+      <ol id="results" class="results"></ol>
+      <nav id="pager" class="pager" hidden>
+        <button id="prev" type="button">← Previous</button>
+        <span id="page-info"></span>
+        <button id="next" type="button">Next →</button>
+      </nav>
+    </main>
+  </section>
+
+  <section id="replay-view" hidden>
+    <header class="bar replay-bar">
+      <a id="back" class="back" href="/">← Results</a>
+      <div class="replay-meta">
+        <h1 id="replay-title"></h1>
+        <p id="replay-sub"></p>
+      </div>
+      <div class="replay-links">
+        <a id="original" target="_blank" rel="noopener noreferrer">original ↗</a>
+        <a id="download">download .wacz</a>
+      </div>
+    </header>
+    <p id="replay-status" class="status" aria-live="polite"></p>
+    <div id="player" class="player"></div>
+  </section>
+</body>
+</html>
