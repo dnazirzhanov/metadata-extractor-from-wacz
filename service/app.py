@@ -101,6 +101,10 @@ def cursor(dict_rows: bool = True):
     try:
         factory = psycopg2.extras.DictCursor if dict_rows else None
         with conn.cursor(cursor_factory=factory) as cur:
+            # Measured 2026-09-14: JIT compile time is pure overhead on these
+            # one-shot plans -- 10-75% faster across the full query mix, never
+            # slower. See causalia-run/HANDOFF-SEARCH-OPTIMIZATION.md.
+            cur.execute("SET LOCAL jit = off")
             yield cur
         conn.rollback()          # read-only: never leave a transaction open
     finally:
@@ -289,8 +293,18 @@ def search(
                                  blocks_per_article=passages_per_article,
                                  **filters)
         # The complete count, so a client can page without guessing where the
-        # end is. matching_ids is deliberately unlimited for exactly this.
-        total = len(S.matching_ids(cur, q, **filters))
+        # end is. search_articles() already carries it on every row (a window
+        # over the same candidates it scores and sorts, before LIMIT/OFFSET) --
+        # cheaper than matching_ids() re-running the whole candidate search a
+        # second time just to call len() on it. The one case that window can't
+        # cover is offset landing past the last match, which returns no rows
+        # and so no total; matching_ids stays deliberately unlimited for that.
+        if rows:
+            total = rows[0]["total_matches"]
+        elif offset == 0:
+            total = 0
+        else:
+            total = len(S.matching_ids(cur, q, **filters))
     except S.UnsupportedQuerySyntax as exc:
         # The refusal is the query layer's, not this service's. Passing the
         # explanation through unchanged keeps one source of truth for what a
