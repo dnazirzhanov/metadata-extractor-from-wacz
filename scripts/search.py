@@ -159,19 +159,28 @@ CANDIDATES = """
             FROM q,
                  unnest(q.terms) WITH ORDINALITY AS t(tsq, ord),
                  LATERAL (
+                     -- Every branch goes through corpus.searchable_article
+                     -- (migration 026). The block and caption branches were
+                     -- already scoped to the current extraction; THE METADATA
+                     -- BRANCH WAS NOT, and that was the hole: an article whose
+                     -- current reading is `failed`, or which produced no prose
+                     -- block at all, still matched on its title, subtitle,
+                     -- description, authors and tags, and answered a search
+                     -- with no citable passage behind it.
                      SELECT a2.id AS article_id
                        FROM corpus.article a2
+                       JOIN corpus.searchable_article sa ON sa.id = a2.id
                       WHERE a2.search_tsv @@ t.tsq
                      UNION
                      SELECT b.article_id
                        FROM corpus.content_block b
-                       JOIN corpus.article a3 ON a3.id = b.article_id
+                       JOIN corpus.searchable_article a3 ON a3.id = b.article_id
                       WHERE b.extraction_id = a3.current_extraction_id
                         AND b.text_tsv @@ t.tsq
                      UNION
                      SELECT i.article_id
                        FROM corpus.article_image i
-                       JOIN corpus.article a4 ON a4.id = i.article_id
+                       JOIN corpus.searchable_article a4 ON a4.id = i.article_id
                       WHERE i.extraction_id = a4.current_extraction_id
                         AND i.caption_tsv @@ t.tsq
                  ) m
@@ -498,7 +507,16 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     """
     require_supported_syntax(query)
     cur.execute(f"""
-        WITH {CANDIDATES}
+        WITH {CANDIDATES},
+        -- The accented query of each term, computed ONCE per search. It depends
+        -- only on the query text, so evaluating corpus.accented_query() inside
+        -- the per-article accent LATERAL below repeated the same PL/pgSQL call
+        -- for every candidate (149,312 times for 'kormany' on the 413k corpus).
+        -- MATERIALIZED pins the single evaluation; ORDER BY ord keeps raw_terms
+        -- order, so the sum below adds the same values in the same order.
+        accent AS MATERIALIZED (
+            SELECT array_agg(corpus.accented_query(t.term) ORDER BY t.ord) AS tsqs
+            FROM q, unnest(q.raw_terms) WITH ORDINALITY AS t(term, ord))
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                e.extraction_status,
@@ -522,25 +540,40 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                tr.term_rank,
                ar.accent_rank
         FROM corpus.article a
+        -- The searchability gate, enforced in the schema rather than in a
+        -- WHERE clause someone has to remember to write. See migrations/026.
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         CROSS JOIN q
         LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
         CROSS JOIN LATERAL (
             -- The BASE score: what each term is worth wherever it sits. Summed
             -- over terms, so an article scores even when no single vector holds
             -- the whole query - which is every article the 012 fix recovered.
-            SELECT coalesce(sum(
-                       ts_rank(a.search_tsv, t.tsq)
-                     + coalesce((SELECT max(ts_rank(b.text_tsv, t.tsq))
-                                   FROM corpus.content_block b
-                                  WHERE b.article_id = a.id
-                                    AND b.extraction_id = a.current_extraction_id
-                                    AND b.text_tsv @@ t.tsq), 0)
-                     + coalesce((SELECT max(ts_rank(i.caption_tsv, t.tsq))
-                                   FROM corpus.article_image i
-                                  WHERE i.article_id = a.id
-                                    AND i.extraction_id = a.current_extraction_id
-                                    AND i.caption_tsv @@ t.tsq), 0)), 0) AS term_rank
-            FROM unnest(q.terms) AS t(tsq)
+            --
+            -- The per-term block and caption probes run ONCE, in the subquery,
+            -- and the lone term's results are exposed as body_1/caption_1: for a
+            -- one-term query the concentration bonus in ORDER BY is the same
+            -- probe with the same tsquery, and it now reuses them instead of
+            -- scanning the article's blocks and captions a second time. OFFSET 0
+            -- keeps the planner from inlining the subquery, which would copy each
+            -- SubPlan into every aggregate that reads it. The sum adds the same
+            -- values in the same order as before.
+            SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0) AS term_rank,
+                   min(p.body)    AS body_1,
+                   min(p.caption) AS caption_1
+            FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
+                         (SELECT max(ts_rank(b.text_tsv, t.tsq))
+                            FROM corpus.content_block b
+                           WHERE b.article_id = a.id
+                             AND b.extraction_id = a.current_extraction_id
+                             AND b.text_tsv @@ t.tsq) AS body,
+                         (SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                            FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ t.tsq) AS caption
+                    FROM unnest(q.terms) AS t(tsq)
+                  OFFSET 0) p
         ) tr
         CROSS JOIN LATERAL (
             -- ACCENT BONUS. Rewards a document whose accents match the query's,
@@ -555,8 +588,8 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             SELECT coalesce(sum(
                        ts_rank(to_tsvector('corpus.hungarian_lemma',
                                    concat_ws(' ', a.title, a.subtitle, a.description)),
-                               corpus.accented_query(t.term))), 0) AS accent_rank
-            FROM unnest(q.raw_terms) AS t(term)
+                               t.tsq)), 0) AS accent_rank
+            FROM accent, unnest(accent.tsqs) AS t(tsq)
         ) ar
         WHERE {MATCH_WHERE}
         ORDER BY (tr.term_rank
@@ -572,16 +605,20 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   -- 0.163-1.886, document-level hits 0.091-0.469, and they
                   -- interleave.
                   + ts_rank(a.search_tsv, q.tsq)
-                  + coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
-                                FROM corpus.content_block b
-                               WHERE b.article_id = a.id
-                                 AND b.extraction_id = a.current_extraction_id
-                                 AND b.text_tsv @@ q.tsq), 0)
-                  + coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
-                                FROM corpus.article_image i
-                               WHERE i.article_id = a.id
-                                 AND i.extraction_id = a.current_extraction_id
-                                 AND i.caption_tsv @@ q.tsq), 0)) DESC,
+                  -- One term: q.tsq IS that term's tsquery, so tr already holds
+                  -- these two probes. CASE runs the ELSE subquery only when taken.
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.body_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
+                                          FROM corpus.content_block b
+                                         WHERE b.article_id = a.id
+                                           AND b.extraction_id = a.current_extraction_id
+                                           AND b.text_tsv @@ q.tsq), 0) END
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.caption_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
+                                          FROM corpus.article_image i
+                                         WHERE i.article_id = a.id
+                                           AND i.extraction_id = a.current_extraction_id
+                                           AND i.caption_tsv @@ q.tsq), 0) END) DESC,
                  a.published_at DESC NULLS LAST,
                  -- Deterministic last resort. 'Magyarország' puts 82 articles
                  -- on one score and 63 on another, so without this the tail of
@@ -648,6 +685,7 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
         WITH {CANDIDATES}
         SELECT a.id
         FROM corpus.article a
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         CROSS JOIN q
         WHERE {MATCH_WHERE}
     """, {"query": query, "outlet": outlet, "tag": tag, "author": author,
@@ -669,6 +707,7 @@ def search_article_content(cur, query: str, *, limit: int = 20,
                            {QUERY}(%(q)s), %(opts)s) AS headline
         FROM corpus.content_block b
         JOIN corpus.article a ON a.id = b.article_id
+        JOIN corpus.searchable_article sa ON sa.id = a.id
         WHERE b.extraction_id = a.current_extraction_id
           AND b.text_tsv @@ {QUERY}(%(q)s)
           AND (NOT %(phrase)s OR {PHRASE}(b.block_text, %(q)s))
@@ -691,10 +730,12 @@ def filter_by_tag(cur, tag: str, *, limit: int = 50) -> list[dict]:
     prose, which is the wrong answer for a filter (docs/postgres-schema.md D.3).
     """
     cur.execute("""
-        SELECT id, url_hash, title, outlet, published_at, canonical_url, tags
-        FROM corpus.article
-        WHERE tags @> ARRAY[%(tag)s]::text[]
-        ORDER BY published_at DESC NULLS LAST
+        SELECT a.id, a.url_hash, a.title, a.outlet, a.published_at,
+               a.canonical_url, a.tags
+        FROM corpus.article a
+        JOIN corpus.searchable_article sa ON sa.id = a.id
+        WHERE a.tags @> ARRAY[%(tag)s]::text[]
+        ORDER BY a.published_at DESC NULLS LAST
         LIMIT %(limit)s
     """, {"tag": tag, "limit": limit})
     return [dict(row) for row in cur.fetchall()]

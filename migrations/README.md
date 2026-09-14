@@ -24,6 +24,12 @@ Plain, idempotent SQL. Design and rationale: [../docs/postgres-schema.md](../doc
 | `018_accented_surface.sql` | `corpus.accented_raw_lexemes`; fixes the split paradigm 017 caused — `párt` had stopped finding `pártok` |
 | `019_unaccented_case_suffix.sql` | `corpus.restorable_case_suffixes`, `corpus.reaccented_lemmas`; an accent-free case suffix still stems — `kormanyrol` reached 0 articles where `kormányról` reached 94 |
 | `020_accented_stopword_fallback.sql` | an accented stopword falls back to its folded surface form — `arról` reached 0 where `arrol` reached 208, and one such word made a whole multi-term query unsatisfiable |
+| `021_phrase_match_adjacency.sql` | a phrase is a phrase: adjacency, and the accent the reader typed |
+| `022_phrase_match_folded_branch.sql` | the folded branch needs a configuration without a stopword list — fixes what 021 got wrong |
+| `023_short_accented_lemma_fallback.sql` | a word whose lemma is two letters long must still find itself — `két` could not find itself |
+| `024_extraction_task.sql` | `corpus.extraction_task` — the work ledger: what has been attempted, by whom, and how it went. One live claim per URL, leases rather than ages |
+| `025_extraction_quality.sql` | `article_extraction.content_block_count`, and a CHECK that a `failed` reading can never be the current one |
+| `026_searchable_article.sql` | `corpus.searchable_article` — the searchability invariant as a view every user-facing query joins |
 
 ## What these do and do not touch
 

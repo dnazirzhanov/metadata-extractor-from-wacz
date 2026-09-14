@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS archives (
     status TEXT NOT NULL DEFAULT 'in_progress'
            CHECK (status IN ('in_progress','success','failed')),
     wacz_path TEXT, wacz_sha256 TEXT, wacz_size_bytes BIGINT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT now());
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Added 2026-09-11 with the production ingestion path, which reads both:
+    -- resolve_capture() orders by finished_at to pick the NEWEST successful
+    -- capture of a URL, and the extraction frontier excludes
+    -- doc_http_status !~ '^2' - error bodies archived as successes, which
+    -- extract into plausible articles (~38,000 corpus-wide).
+    finished_at TIMESTAMPTZ,
+    doc_http_status TEXT);
 
 CREATE TABLE IF NOT EXISTS videos (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
 

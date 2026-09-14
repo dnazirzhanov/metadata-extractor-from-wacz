@@ -49,6 +49,23 @@ def check(condition: bool, message: str) -> None:
 from cx_ingest import ingest, load, seed_crawler_rows        # noqa: E402,F401
 
 
+def seed_and_ingest(cur, directory):
+    """Ingest one directory into THIS harness's throwaway database.
+
+    Production ingestion does a LOOKUP: `corpus` never writes to the crawler's
+    tables, and an article whose capture public.archives has no record of is
+    refused rather than invented. A throwaway database has no crawler rows at
+    all, so the harness creates them itself - explicitly, and saying out loud
+    that it owns this database. That is the whole point of the
+    confirm_development fence: the seeding path still exists, and it can no
+    longer be reached by accident from the ingestion path.
+    """
+    article = load(directory, "article.json")
+    capture = seed_crawler_rows(cur, directory, article,
+                                confirm_development=True)
+    return ingest(cur, directory, capture=capture)
+
+
 
 
 # ---------------------------------------------------------------------
@@ -354,7 +371,7 @@ def main(argv: list[str]) -> int:
     synthetic_skipped = 0
     with connection.cursor() as cur:
         for directory in directories:
-            article_id, extraction_id, skipped = ingest(cur, directory)
+            article_id, extraction_id, skipped = seed_and_ingest(cur, directory)
             ids[directory] = (article_id, extraction_id)
             synthetic_skipped += skipped
         connection.commit()
@@ -391,7 +408,7 @@ def main(argv: list[str]) -> int:
         cur.execute("SELECT count(*) FROM corpus.article")
         articles_before = cur.fetchone()[0]
         for directory in directories:
-            ingest(cur, directory)
+            seed_and_ingest(cur, directory)
         connection.commit()
 
     with connection.cursor() as cur:
