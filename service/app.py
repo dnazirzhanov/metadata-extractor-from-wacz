@@ -101,6 +101,10 @@ def cursor(dict_rows: bool = True):
     try:
         factory = psycopg2.extras.DictCursor if dict_rows else None
         with conn.cursor(cursor_factory=factory) as cur:
+            # Measured 2026-09-14: JIT compile time is pure overhead on these
+            # one-shot plans -- 10-75% faster across the full query mix, never
+            # slower. See causalia-run/HANDOFF-SEARCH-OPTIMIZATION.md.
+            cur.execute("SET LOCAL jit = off")
             yield cur
         conn.rollback()          # read-only: never leave a transaction open
     finally:
