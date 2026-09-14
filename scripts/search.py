@@ -593,11 +593,19 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             -- the one it came from. Ranking can, by rebuilding the accented
             -- vector for the metadata - which is where names live - and asking
             -- corpus.accented_query() (017).
-            SELECT coalesce(sum(
-                       ts_rank(to_tsvector('corpus.hungarian_lemma',
-                                   concat_ws(' ', a.title, a.subtitle, a.description)),
-                               t.tsq)), 0) AS accent_rank
-            FROM accent, unnest(accent.tsqs) AS t(tsq)
+            -- The vector depends only on the article, so av builds it ONCE per
+            -- candidate and the per-term sum reads it. Written inside the sum it
+            -- was rebuilt once per TERM - twice per candidate on a two-term query.
+            -- av's OFFSET 0 is load-bearing: without it the planner folds av
+            -- back into the sum and the plan is unchanged. The outer OFFSET 0
+            -- keeps accent_rank one computed column for both the SELECT list and
+            -- ORDER BY, for the same reason tr has one.
+            SELECT (SELECT coalesce(sum(ts_rank(av.v, t.tsq)), 0)
+                      FROM accent, unnest(accent.tsqs) AS t(tsq)) AS accent_rank
+            FROM (SELECT to_tsvector('corpus.hungarian_lemma',
+                             concat_ws(' ', a.title, a.subtitle, a.description))
+                  OFFSET 0) AS av(v)
+            OFFSET 0
         ) ar
         WHERE {MATCH_WHERE}
         ORDER BY (tr.term_rank
