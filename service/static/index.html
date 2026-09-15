@@ -12,8 +12,12 @@
     <header class="bar">
       <a class="brand" href="/">Causalia</a>
       <form id="search-form" role="search">
-        <input id="q" name="q" type="search" placeholder="Search the archive…" autocomplete="off" required>
+        <input id="q" name="q" type="search" placeholder="Search the archive…" autocomplete="off">
         <label class="toggle"><input id="phrase" name="phrase" type="checkbox"> exact phrase</label>
+        <span class="dates">
+          <label class="date-field">from <input id="from" name="from" type="date"></label>
+          <label class="date-field">to <input id="to" name="to" type="date"></label>
+        </span>
         <button type="submit">Search</button>
       </form>
     </header>

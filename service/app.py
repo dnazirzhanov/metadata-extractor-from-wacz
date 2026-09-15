@@ -54,7 +54,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager, contextmanager
-from datetime import timezone
+from datetime import date, timezone
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +109,21 @@ app = FastAPI(
             "to an exact passage in the archived page.",
     lifespan=lifespan,
 )
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+#: The page and its scripts are revalidated on every load - a 304 when nothing changed.
+#: Without a Cache-Control header a browser reuses its copy heuristically, so after a
+#: deploy it served the new index.html with the previous app.js: the date fields showed
+#: and did nothing.
+NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class _RevalidatedStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers.update(NO_CACHE)
+        return response
+
+
+app.mount("/static", _RevalidatedStaticFiles(directory=STATIC_DIR), name="static")
 # Same origin as the API and the captures, so the replay service worker can fetch both.
 # html=True: the player's frame opens /replay/?source=... and needs index.html before the worker controls it.
 app.mount("/replay", StaticFiles(directory=REPLAY_ASSETS, html=True, check_dir=False), name="replay")
@@ -117,7 +131,7 @@ app.mount("/replay", StaticFiles(directory=REPLAY_ASSETS, html=True, check_dir=F
 
 @app.get("/", include_in_schema=False)
 def ui():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers=NO_CACHE)
 
 
 @contextmanager
@@ -353,6 +367,57 @@ def search(
                         match_reason=r["match_reason"],
                         passages=[_passage(b, q) for b in r["blocks"]])
               for r in rows])
+
+
+class ArticleList(BaseModel):
+    total_articles: int = Field(
+        description="every searchable article published in the range, not the page size")
+    limit: int
+    offset: int
+    date_from: str | None
+    date_to: str | None
+    articles: list[ArticleRef]
+
+
+#: The bounds scripts/search.py's MATCH_WHERE puts on a search, so a date range means
+#: the same thing with words and without them: `to` covers that whole day, and days
+#: are the database's (UTC). searchable_article is the same gate a search goes through.
+_PUBLISHED_IN = """
+      FROM corpus.article a
+      JOIN corpus.searchable_article sa ON sa.id = a.id
+     WHERE (%(date_from)s IS NULL OR a.published_at >= %(date_from)s::timestamptz)
+       AND (%(date_to)s IS NULL OR a.published_at < (%(date_to)s::date + 1)::timestamptz)"""
+
+
+@app.get("/articles", response_model=ArticleList, tags=["corpus"])
+def articles_by_date(
+    date_from: date | None = Query(None, alias="from", description="YYYY-MM-DD"),
+    date_to: date | None = Query(None, alias="to", description="YYYY-MM-DD, inclusive"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    cur=Depends(_cur),
+):
+    """Articles published in a date range, newest first - the listing without words.
+
+    With words, /search takes the same `from` / `to`.
+    """
+    if date_from is None and date_to is None:
+        raise HTTPException(400, "give a from date, a to date, or both (YYYY-MM-DD)")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, f"the from date ({date_from}) is after the to date ({date_to})")
+    params = {"date_from": date_from, "date_to": date_to, "limit": limit, "offset": offset}
+    cur.execute("SELECT count(*) AS n" + _PUBLISHED_IN, params)
+    total = cur.fetchone()["n"]
+    cur.execute("""
+        SELECT a.id, a.url_hash, a.outlet, a.title, a.published_at, a.section,
+               a.tags, a.authors, a.source_url, a.canonical_url""" + _PUBLISHED_IN + """
+         ORDER BY a.published_at DESC NULLS LAST, a.id
+         LIMIT %(limit)s OFFSET %(offset)s""", params)
+    return ArticleList(
+        total_articles=total, limit=limit, offset=offset,
+        date_from=date_from.isoformat() if date_from else None,
+        date_to=date_to.isoformat() if date_to else None,
+        articles=[_article_ref(r) for r in cur.fetchall()])
 
 
 @app.get("/articles/{article_id}", response_model=ArticleRef, tags=["corpus"])
