@@ -9,12 +9,23 @@ const REASONS = {
   document: "terms spread across the article",
 };
 
+// The replay service worker, told to inject static/replay-guard.js into every archived page (that
+// file says why). The player appends "?serveIndex=1" to this name itself - the embed and its frame
+// both do - so the trailing "&_=" swallows that second "?": both register this same worker URL, and
+// serveIndex still reaches the worker. Injected paths must come in on the worker URL; the worker
+// refuses to fetch ones passed only through the embed's config.
+const REPLAY_WORKER = "sw.js?serveIndex=1&injectScripts=/static/replay-guard.js&_=";
+
 const $ = (id) => document.getElementById(id);
-const cache = new Map();   // "q|phrase|page" -> /search response, so Back is instant
+const cache = new Map();   // "q|phrase|from|to|page" -> results, so Back is instant
 let inflight = null;       // AbortController of the running request
 let tick = null;           // elapsed-time interval
 let cameFromResults = false;
 let replayUI = null;       // promise for /replay/ui.js, loaded on first replay
+
+// Publication dates as the date inputs and the API write them; anything else is ignored.
+const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : null);
+const ordered = (from, to) => (from && to && from > to ? { from: to, to: from } : { from, to });
 
 function readState() {
   const p = new URLSearchParams(location.search);
@@ -23,6 +34,7 @@ function readState() {
     phrase: p.get("phrase") === "1",
     page: Math.max(1, parseInt(p.get("page") || "1", 10) || 1),
     article: p.get("article"),
+    ...ordered(day(p.get("from")), day(p.get("to"))),
   };
 }
 
@@ -30,6 +42,8 @@ function urlFor(s) {
   const p = new URLSearchParams();
   if (s.q) p.set("q", s.q);
   if (s.phrase) p.set("phrase", "1");
+  if (s.from) p.set("from", s.from);
+  if (s.to) p.set("to", s.to);
   if (s.page > 1) p.set("page", String(s.page));
   if (s.article) p.set("article", String(s.article));
   const query = p.toString();
@@ -124,9 +138,17 @@ function card(hit, s) {
   const passage = hit.passages[0];
   if (passage && passage.highlight) link.append(snippet(passage.highlight));
   else if (passage) link.append(el("p", "card-snippet", passage.text));
-  link.append(el("span", "chip", REASONS[hit.match_reason] || hit.match_reason));
+  if (hit.match_reason) link.append(el("span", "chip", REASONS[hit.match_reason] || hit.match_reason));
   li.append(link);
   return li;
+}
+
+// "published 2024-03-01 – 2024-03-31", "published on 2024-03-15", or "" when no date is set.
+function rangeText(s) {
+  if (s.from && s.to) return s.from === s.to ? `published on ${s.from}` : `published ${s.from} – ${s.to}`;
+  if (s.from) return `published from ${s.from}`;
+  if (s.to) return `published up to ${s.to}`;
+  return "";
 }
 
 function drawResults(s, body, seconds) {
@@ -134,13 +156,33 @@ function drawResults(s, body, seconds) {
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   $("results").replaceChildren(...body.hits.map((hit) => card(hit, s)));
   const took = seconds === undefined ? "" : ` · ${seconds.toFixed(1)} s`;
-  if (total === 0) setStatus($("status"), `No articles match “${s.q}”${took}`);
-  else if (!body.hits.length) setStatus($("status"), `${fmtInt(total)} articles · page ${s.page} is past the last page`);
-  else setStatus($("status"), `${fmtInt(total)} article${total === 1 ? "" : "s"} · page ${s.page} of ${fmtInt(pages)}${took}`);
+  const range = rangeText(s) ? ` ${rangeText(s)}` : "";
+  if (total === 0) setStatus($("status"), s.q ? `No articles match “${s.q}”${range}${took}` : `No articles${range}${took}`);
+  else if (!body.hits.length) setStatus($("status"), `${fmtInt(total)} articles${range} · page ${s.page} is past the last page`);
+  else setStatus($("status"), `${fmtInt(total)} article${total === 1 ? "" : "s"}${range} · page ${s.page} of ${fmtInt(pages)}${took}`);
   $("pager").hidden = pages <= 1 && s.page <= 1;
   $("prev").disabled = s.page <= 1;
   $("next").disabled = s.page >= pages;
   $("page-info").textContent = `${s.page} / ${fmtInt(pages)}`;
+}
+
+// With words, /search takes the dates as filters. Without words, /articles lists the date range; its
+// rows are put in /search's shape so the cards and pager are shared (no passage, no match reason).
+async function fetchPage(s, signal) {
+  const params = new URLSearchParams({ limit: PAGE_SIZE, offset: (s.page - 1) * PAGE_SIZE });
+  if (s.from) params.set("from", s.from);
+  if (s.to) params.set("to", s.to);
+  if (s.q) {
+    params.set("q", s.q);
+    params.set("phrase", s.phrase);
+    params.set("passages_per_article", 1);
+    return fetchJSON(`/search?${params}`, signal, "Search failed");
+  }
+  const list = await fetchJSON(`/articles?${params}`, signal, "Listing failed");
+  return {
+    total_articles: list.total_articles,
+    hits: list.articles.map((article) => ({ article, passages: [], match_reason: null })),
+  };
 }
 
 async function showResults(s) {
@@ -148,27 +190,25 @@ async function showResults(s) {
   $("player").replaceChildren();
   $("replay-view").hidden = true;
   $("search-view").hidden = false;
-  document.title = s.q ? `${s.q} · Causalia search` : "Causalia search";
+  const label = [s.q, rangeText(s)].filter(Boolean).join(" · ");
+  document.title = label ? `${label} · Causalia search` : "Causalia search";
   $("results").replaceChildren();
   $("pager").hidden = true;
-  if (!s.q) {
+  if (!s.q && !s.from && !s.to) {
     setStatus($("status"), "");
     $("q").focus();
     return;
   }
-  const key = `${s.q}|${s.phrase ? 1 : 0}|${s.page}`;
+  const key = `${s.q}|${s.phrase ? 1 : 0}|${s.from || ""}|${s.to || ""}|${s.page}`;
   if (cache.has(key)) {
     drawResults(s, cache.get(key));
     return;
   }
   const ctrl = new AbortController();
   inflight = ctrl;
-  const t0 = startTimer("Searching");
+  const t0 = startTimer(s.q ? "Searching" : "Listing");
   try {
-    const params = new URLSearchParams({
-      q: s.q, phrase: s.phrase, limit: PAGE_SIZE, offset: (s.page - 1) * PAGE_SIZE, passages_per_article: 1,
-    });
-    const body = await fetchJSON(`/search?${params}`, ctrl.signal, "Search failed");
+    const body = await fetchPage(s, ctrl.signal);
     cache.set(key, body);
     if (inflight !== ctrl) return;
     stopTimer();
@@ -237,6 +277,7 @@ async function showReplay(s) {
     if (info.ts) player.setAttribute("ts", info.ts);
     player.setAttribute("replaybase", "/replay/");
     player.setAttribute("embed", "replayonly");
+    player.setAttribute("swName", REPLAY_WORKER);
     $("player").append(player);
     setStatus($("replay-status"), "The first replay can take 10–20 s while the player starts.");
   } catch (err) {
@@ -251,6 +292,8 @@ function render() {
   const s = readState();
   $("q").value = s.q;
   $("phrase").checked = s.phrase;
+  $("from").value = s.from || "";
+  $("to").value = s.to || "";
   if (s.article) showReplay(s);
   else showResults(s);
 }
@@ -261,7 +304,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("search-form").addEventListener("submit", (e) => {
     e.preventDefault();
     const q = $("q").value.trim();
-    if (q) navigate({ q, phrase: $("phrase").checked, page: 1 });
+    const { from, to } = ordered(day($("from").value), day($("to").value));
+    if (q || from || to) navigate({ q, phrase: $("phrase").checked, from, to, page: 1 });
+    else $("q").focus();
   });
   $("prev").addEventListener("click", () => {
     const s = readState();

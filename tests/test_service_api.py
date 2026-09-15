@@ -259,3 +259,64 @@ class TestUI:
         assert page.status_code == 200
         assert 'id="search-form"' in page.text
         assert client.get("/static/app.js").status_code == 200
+
+    def test_the_page_and_its_scripts_are_always_revalidated(self, client):
+        """Otherwise a browser keeps running the previous app.js after a deploy."""
+        for path in ("/", "/static/app.js", "/static/app.css"):
+            assert client.get(path).headers.get("cache-control") == "no-cache", path
+
+    def test_the_script_the_replay_worker_injects_exists(self, client):
+        """app.js names the guard only inside the worker URL; renaming one side would
+        silently bring back the page-wiping anti-adblock redirect in every replay."""
+        app_js = client.get("/static/app.js").text
+        injected = re.search(r"injectScripts=([^&\"]+)", app_js)
+        assert injected, "app.js no longer asks the replay worker to inject anything"
+        r = client.get(injected.group(1))
+        assert r.status_code == 200
+        assert "javascript" in r.headers["content-type"]
+
+
+class TestDateFilter:
+    """Articles by publication date: alone through /articles, with words through /search.
+
+    Days are the database's (UTC), and published_at comes back in that zone, so its
+    first ten characters are the day the filter compared.
+    """
+
+    def test_a_month_lists_only_that_month_newest_first(self, client, populated):
+        r = client.get("/articles", params={"from": "2024-03-01", "to": "2024-03-31", "limit": 50})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        dates = [a["published_at"] for a in body["articles"]]
+        assert dates, "no articles published in March 2024"
+        assert all("2024-03-01" <= d[:10] <= "2024-03-31" for d in dates)
+        assert dates == sorted(dates, reverse=True)
+        assert body["total_articles"] >= len(dates)
+
+    def test_one_day_is_that_whole_day_and_nothing_else(self, client, populated):
+        body = client.get("/articles", params={"from": "2024-03-15", "to": "2024-03-15",
+                                               "limit": 100}).json()
+        assert body["articles"], "no articles published on 2024-03-15"
+        assert {a["published_at"][:10] for a in body["articles"]} == {"2024-03-15"}
+
+    def test_a_listing_needs_a_date(self, client):
+        assert client.get("/articles").status_code == 400
+
+    def test_from_after_to_is_refused(self, client):
+        r = client.get("/articles", params={"from": "2024-04-01", "to": "2024-03-01"})
+        assert r.status_code == 400
+
+    def test_a_malformed_date_is_refused(self, client):
+        assert client.get("/articles", params={"from": "2024-13-45"}).status_code == 422
+
+    def test_words_and_dates_together(self, client, populated):
+        wide = client.get("/search", params={"q": "Zrínyi", "limit": 20}).json()
+        narrow = client.get("/search", params={"q": "Zrínyi", "from": "2023-01-01",
+                                               "to": "2023-12-31", "limit": 20}).json()
+        assert narrow["hits"], "no Zrínyi article published in 2023"
+        assert narrow["total_articles"] <= wide["total_articles"]
+        assert all(h["article"]["published_at"][:4] == "2023" for h in narrow["hits"])
+
+    def test_the_page_has_the_date_fields(self, client):
+        page = client.get("/").text
+        assert 'id="from"' in page and 'id="to"' in page
