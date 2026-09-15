@@ -259,3 +259,13 @@ class TestUI:
         assert page.status_code == 200
         assert 'id="search-form"' in page.text
         assert client.get("/static/app.js").status_code == 200
+
+    def test_the_script_the_replay_worker_injects_exists(self, client):
+        """app.js names the guard only inside the worker URL; renaming one side would
+        silently bring back the page-wiping anti-adblock redirect in every replay."""
+        app_js = client.get("/static/app.js").text
+        injected = re.search(r"injectScripts=([^&\"]+)", app_js)
+        assert injected, "app.js no longer asks the replay worker to inject anything"
+        r = client.get(injected.group(1))
+        assert r.status_code == 200
+        assert "javascript" in r.headers["content-type"]

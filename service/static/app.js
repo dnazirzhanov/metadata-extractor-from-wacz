@@ -9,6 +9,13 @@ const REASONS = {
   document: "terms spread across the article",
 };
 
+// The replay service worker, told to inject static/replay-guard.js into every archived page (that
+// file says why). The player appends "?serveIndex=1" to this name itself - the embed and its frame
+// both do - so the trailing "&_=" swallows that second "?": both register this same worker URL, and
+// serveIndex still reaches the worker. Injected paths must come in on the worker URL; the worker
+// refuses to fetch ones passed only through the embed's config.
+const REPLAY_WORKER = "sw.js?serveIndex=1&injectScripts=/static/replay-guard.js&_=";
+
 const $ = (id) => document.getElementById(id);
 const cache = new Map();   // "q|phrase|page" -> /search response, so Back is instant
 let inflight = null;       // AbortController of the running request
@@ -237,6 +244,7 @@ async function showReplay(s) {
     if (info.ts) player.setAttribute("ts", info.ts);
     player.setAttribute("replaybase", "/replay/");
     player.setAttribute("embed", "replayonly");
+    player.setAttribute("swName", REPLAY_WORKER);
     $("player").append(player);
     setStatus($("replay-status"), "The first replay can take 10–20 s while the player starts.");
   } catch (err) {
