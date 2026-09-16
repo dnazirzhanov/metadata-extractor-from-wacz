@@ -434,6 +434,58 @@ class TestRankingAndCitation:
                             WHERE a.id = %s""", (hit["id"],))
             assert hit["extraction_status"] == cur.fetchone()[0]
 
+    def test_accent_vector_lexemes_are_in_search_tsv(self, cur):
+        """The accent bonus skips an article whose search_tsv matches none of the
+        query's accented lexemes. That is only exact while every lexeme of the
+        accent vector is also in search_tsv - which corpus.search_vector() makes
+        true today. A change to either vector must turn this red."""
+        cur.execute("""
+            SELECT count(*),
+                   count(*) FILTER (WHERE NOT tsvector_to_array(to_tsvector('corpus.hungarian_lemma',
+                                              concat_ws(' ', a.title, a.subtitle, a.description)))
+                                          <@ tsvector_to_array(a.search_tsv))
+              FROM corpus.article a
+             WHERE hashtext(a.id::text) % 500 = 0
+                OR (SELECT count(*) FROM corpus.article) < 5000""")
+        sampled, uncovered = cur.fetchone()
+        if not sampled:
+            pytest.skip("no article sampled")
+        assert uncovered == 0, f"{uncovered} of {sampled} accent vectors hold a lexeme search_tsv lacks"
+
+    def test_ts_rank_without_the_querys_lexemes_is_zero_only_for_or_queries(self, cur):
+        """What the skipped accent bonus returns (0) is what ts_rank gives a vector
+        holding none of a query's lexemes - for a query built from | alone. An &
+        query gives 1e-20 instead, which is why such a query is never skipped."""
+        cur.execute("""
+            SELECT ts_rank(to_tsvector('corpus.hungarian_lemma', 'alma körte szilva'), $$'kormány':*$$::tsquery),
+                   ts_rank(to_tsvector('corpus.hungarian_lemma', 'alma körte szilva'), $$'orb' | 'orbán'$$::tsquery),
+                   ts_rank(''::tsvector, $$'orb' | 'orbán'$$::tsquery),
+                   ts_rank(to_tsvector('corpus.hungarian_lemma', 'alma körte szilva'), $$'orb' & 'orbán'$$::tsquery)""")
+        single, either, empty, both = cur.fetchone()
+        assert (single, either, empty) == (0.0, 0.0, 0.0)
+        assert both != 0.0
+
+    @pytest.mark.parametrize("query", ["kormány", "Orbán Viktor"], ids=["one-term", "two-term"])
+    def test_accent_rank_equals_its_per_article_definition(self, cur, dcur, query):
+        """accent_rank against the unconditional per-article form, exactly, on the
+        first page and on the last - where hits rarely carry the word in their
+        metadata, so the skip is taken."""
+        first = S.search_articles(dcur, query, limit=25)
+        if not first:
+            pytest.skip("no hit for the query in this corpus")
+        total = first[0]["total_matches"]
+        last = S.search_articles(dcur, query, limit=25, offset=max(total - 25, 0))
+        for hit in first + last:
+            cur.execute("""
+                SELECT coalesce(sum(ts_rank(to_tsvector('corpus.hungarian_lemma',
+                                                concat_ws(' ', a.title, a.subtitle, a.description)),
+                                            corpus.accented_query(t.term)) ORDER BY t.ord), 0)
+                  FROM corpus.article a,
+                       unnest(regexp_split_to_array(corpus.collapse_whitespace(%s), '[ -]+'))
+                           WITH ORDINALITY AS t(term, ord)
+                 WHERE a.id = %s""", (query, hit["id"]))
+            assert hit["accent_rank"] == cur.fetchone()[0], f"article {hit['id']}"
+
     def test_a_body_hit_carries_a_citable_block(self, dcur):
         for hit in S.search_articles(dcur, "kormány", limit=25):
             if hit["match_reason"] in ("body", "both"):

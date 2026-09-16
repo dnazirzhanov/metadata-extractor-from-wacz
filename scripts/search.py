@@ -646,9 +646,18 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
         -- for every candidate (149,312 times for 'kormany' on the 413k corpus).
         -- MATERIALIZED pins the single evaluation; ORDER BY ord keeps raw_terms
         -- order, so the sum below adds the same values in the same order.
+        -- any_tsq ORs every term's accented query and plain_or says none of them
+        -- uses an operator other than | (or a weight); the accent bonus below
+        -- uses both to skip articles that cannot score. The inner OFFSET 0 keeps
+        -- corpus.accented_query() at one call per term.
         accent AS MATERIALIZED (
-            SELECT array_agg(corpus.accented_query(t.term) ORDER BY t.ord) AS tsqs
-            FROM q, unnest(q.raw_terms) WITH ORDINALITY AS t(term, ord))
+            SELECT array_agg(x.tsq ORDER BY x.ord) AS tsqs,
+                   NOT coalesce(bool_or(x.tsq::text ~ '[&!<]|:[*]?[ABCD]'), false) AS plain_or,
+                   (string_agg('(' || x.tsq::text || ')', ' | ' ORDER BY x.ord)
+                        FILTER (WHERE numnode(x.tsq) > 0))::tsquery AS any_tsq
+            FROM (SELECT t.ord, corpus.accented_query(t.term) AS tsq
+                    FROM q, unnest(q.raw_terms) WITH ORDINALITY AS t(term, ord)
+                  OFFSET 0) x)
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
                -- A subquery rather than a join: like body_rank and caption_rank
@@ -714,11 +723,32 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             -- back into the sum and the plan is unchanged. The outer OFFSET 0
             -- keeps accent_rank one computed column for both the SELECT list and
             -- ORDER BY, for the same reason tr has one.
-            SELECT (SELECT coalesce(sum(ts_rank(av.v, t.tsq)), 0)
-                      FROM accent, unnest(accent.tsqs) AS t(tsq)) AS accent_rank
-            FROM (SELECT to_tsvector('corpus.hungarian_lemma',
-                             concat_ws(' ', a.title, a.subtitle, a.description))
-                  OFFSET 0) AS av(v)
+            --
+            -- SKIPPED WHERE IT CANNOT SCORE. The tokenizer was most of this bonus's
+            -- cost (4.6 s of kormány's 10.4 s), and on most candidates it proves
+            -- nothing: seven in ten of kormány's have the word only in their body. The
+            -- ELSE 0 is the value the THEN branch would have computed:
+            --   - every lexeme of av is in a.search_tsv: corpus.search_vector()
+            --     stores to_tsvector('corpus.hungarian_lemma', ...) of the title,
+            --     subtitle and description, and joining them with a space makes
+            --     no token the fields did not have;
+            --   - so a.search_tsv not matching any_tsq - with the same prefix
+            --     semantics - means av holds no lexeme of any term's query;
+            --   - and ts_rank of such a vector against a query built only from
+            --     | is exactly 0 (calc_rank_or adds nothing; an empty vector is
+            --     0 too), so the sum is 0. An & query ranks a vector without its
+            --     lexemes 1e-20, not 0 - hence plain_or, which sends any query
+            --     with another operator or a weight down the THEN branch.
+            -- tests/test_search_db.py pins the lexeme containment and this value.
+            SELECT CASE WHEN NOT accent.plain_or OR a.search_tsv @@ accent.any_tsq
+                        THEN (SELECT (SELECT coalesce(sum(ts_rank(av.v, t.tsq)), 0)
+                                        FROM accent, unnest(accent.tsqs) AS t(tsq))
+                                FROM (SELECT to_tsvector('corpus.hungarian_lemma',
+                                                 concat_ws(' ', a.title, a.subtitle, a.description))
+                                      OFFSET 0) AS av(v)
+                              OFFSET 0)
+                        ELSE 0 END AS accent_rank
+            FROM accent
             OFFSET 0
         ) ar
         WHERE {where}
