@@ -148,12 +148,13 @@ META_HIT = (
 #:
 #: Zero terms (an empty query, or one that is all stopwords) yields no rows and
 #: therefore matches nothing, which is what corpus.search_query already answered.
-CANDIDATES = """
+QUERY_CTE = """
         q AS (SELECT corpus.search_query(%(query)s) AS tsq,
                      corpus.search_terms(%(query)s) AS terms,
                      -- the term STRINGS, for corpus.accented_query() in ranking
                      regexp_split_to_array(
-                         corpus.collapse_whitespace(%(query)s), '[ -]+') AS raw_terms),
+                         corpus.collapse_whitespace(%(query)s), '[ -]+') AS raw_terms),"""
+CANDIDATES = QUERY_CTE + """
         doc AS (
             SELECT m.article_id
             FROM q,
@@ -190,6 +191,65 @@ CANDIDATES = """
             HAVING count(DISTINCT t.ord) = (SELECT cardinality(terms) FROM q)
         )"""
 
+#: CANDIDATES for a query of exactly ONE term, carrying forward what ranking
+#: needs from the rows that matched. search_articles() uses it only then;
+#: multi-term searches and matching_ids() keep CANDIDATES.
+#:
+#: The block and caption branches read every matching block and caption of
+#: every searchable article through the GIN indexes, and threw them away.
+#: Ranking then went back per candidate, read ALL of the article's blocks (~15)
+#: and re-tested each one to find the ~2 that match - 5.8 s of kormány's 17.8 s
+#: over 149,312 candidates. Here each matching row is ranked where it is read:
+#:
+#:   body     max ts_rank(text_tsv, term)    over the article's matching blocks
+#:   caption  max ts_rank(caption_tsv, term) over its matching captions
+#:
+#: These are the probes they replace, not approximations of them: the same rows
+#: (the current extraction's blocks and captions matching the term, and every
+#: candidate is searchable), the same ts_rank inputs, max() does not depend on
+#: the order it sees them in, and NULL where nothing matched is the probe's max()
+#: over no rows. The probe had no `caption_tsv <> ''`, but an empty vector
+#: matches no term, so the partial index's predicate removes nothing it ranked.
+#: With one term the GROUP BY is CANDIDATES' UNION, and its HAVING always holds.
+#:
+#: ONE term only, because only then does every matching row belong to a result.
+#: With several, the rows of the most common term are ranked before the terms
+#: are intersected: measured 2026-09-16 with this ranking extended to every
+#: query, 'kormány Zrínyi' ranked all 305,772 kormány blocks for 163 results and
+#: went from 2.34 to 3.72 s (while 'Orbán Viktor' went from 10.7 to 6.3 s).
+#: Multi-term queries keep the per-candidate probes until ranking can wait for
+#: the intersection.
+ONE_TERM_CANDIDATES = QUERY_CTE + """
+        doc AS (
+            SELECT h.article_id,
+                   max(h.body)    AS body,
+                   max(h.caption) AS caption
+            FROM q,
+                 unnest(q.terms) AS t(tsq),
+                 LATERAL (
+                     -- The branches, joins and filters of CANDIDATES.
+                     SELECT a2.id AS article_id,
+                            NULL::real AS body, NULL::real AS caption
+                       FROM corpus.article a2
+                       JOIN corpus.searchable_article sa ON sa.id = a2.id
+                      WHERE a2.search_tsv @@ t.tsq
+                     UNION ALL
+                     SELECT b.article_id, ts_rank(b.text_tsv, t.tsq), NULL
+                       FROM corpus.content_block b
+                       JOIN corpus.searchable_article a3 ON a3.id = b.article_id
+                      WHERE b.extraction_id = a3.current_extraction_id
+                        AND b.text_tsv @@ t.tsq
+                     UNION ALL
+                     SELECT i.article_id, NULL, ts_rank(i.caption_tsv, t.tsq)
+                       FROM corpus.article_image i
+                       JOIN corpus.searchable_article a4 ON a4.id = i.article_id
+                      WHERE i.extraction_id = a4.current_extraction_id
+                        AND i.caption_tsv @@ t.tsq
+                        AND i.caption_tsv <> ''
+                 ) h
+            GROUP BY h.article_id
+        )"""
+
 #: The phrase recheck, unchanged in meaning and now stated once.
 #:
 #: A phrase is contiguous words, so it cannot span two blocks - under --phrase
@@ -222,9 +282,11 @@ PHRASE_HIT = ("""(
 #: Two copies of a WHERE clause is how a ranked result list and the recall set
 #: measured against it quietly stop meaning the same thing - the same argument
 #: that put the ingestion INSERTs in one module (scripts/cx_ingest.py).
+#: MATCH_FILTERS is everything but candidate membership: a one-term search gets
+#: membership by joining ONE_TERM_CANDIDATES' `doc`, every other search and
+#: matching_ids() by MATCH_WHERE's IN - the same filters either way, written once.
 #: Expects the CTEs in CANDIDATES, and the same parameter names.
-MATCH_WHERE = ("""a.id IN (SELECT article_id FROM doc)
-          AND (NOT %(phrase)s OR """ + PHRASE_HIT + """)
+MATCH_FILTERS = ("""(NOT %(phrase)s OR """ + PHRASE_HIT + """)
           AND (%(outlet)s  IS NULL OR a.outlet = %(outlet)s)
           AND (%(tag)s     IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
           AND (%(author)s  IS NULL OR a.authors @> ARRAY[%(author)s]::text[])
@@ -233,7 +295,9 @@ MATCH_WHERE = ("""a.id IN (SELECT article_id FROM doc)
                OR a.published_at >= %(date_from)s::timestamptz)
           AND (%(date_to)s IS NULL
                OR a.published_at < (%(date_to)s::date + 1)::timestamptz)
-""".replace("{PHRASE_FN}", PHRASE))
+""")
+MATCH_WHERE = ("""a.id IN (SELECT article_id FROM doc)
+          AND """ + MATCH_FILTERS)
 
 #: A headline is for a human reading a result list; the block's full text is
 #: returned beside it so an agent never has to parse the markers.
@@ -508,8 +572,74 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     `date_to` is INCLUSIVE of the whole day given.
     """
     require_supported_syntax(query)
+    # The term count picks the candidate stage. One term ranks its matching
+    # blocks and captions where it reads them (ONE_TERM_CANDIDATES). Any other
+    # count keeps CANDIDATES and the per-candidate probes, in fragments kept
+    # verbatim - including their now-unreached one-term CASE branches - so those
+    # searches send exactly the SQL they sent before. corpus.search_terms() is
+    # what the candidate stage unnests, so the count cannot disagree with it.
+    cur.execute("SELECT cardinality(corpus.search_terms(%(query)s))",
+                {"query": query})
+    if cur.fetchone()[0] == 1:
+        candidates, where = ONE_TERM_CANDIDATES, MATCH_FILTERS
+        source = "doc d\n        JOIN corpus.article a ON a.id = d.article_id"
+        term_rank = """            -- One term: its best block and caption rank were computed where the
+            -- candidate stage read the matching rows (ONE_TERM_CANDIDATES), and
+            -- arrive as d.body and d.caption. This is the probe form's sum over
+            -- that single term, value for value: sum() of one row is the row.
+            -- OFFSET 0 keeps term_rank one computed column for the SELECT list
+            -- and ORDER BY.
+            SELECT ts_rank(a.search_tsv, q.terms[1]) + coalesce(d.body, 0) + coalesce(d.caption, 0) AS term_rank
+            OFFSET 0
+"""
+        concentration = """                  -- One term: q.tsq IS that term's tsquery, so the concentration
+                  -- bonus is the term's own best block and caption rank.
+                  + coalesce(d.body, 0)
+                  + coalesce(d.caption, 0)"""
+    else:
+        candidates, where = CANDIDATES, MATCH_WHERE
+        source = "corpus.article a"
+        term_rank = """            -- The per-term block and caption probes run ONCE, in the subquery,
+            -- and the lone term's results are exposed as body_1/caption_1: for a
+            -- one-term query the concentration bonus in ORDER BY is the same
+            -- probe with the same tsquery, and it now reuses them instead of
+            -- scanning the article's blocks and captions a second time. OFFSET 0
+            -- keeps the planner from inlining the subquery, which would copy each
+            -- SubPlan into every aggregate that reads it. The sum adds the same
+            -- values in the same order as before.
+            SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0) AS term_rank,
+                   min(p.body)    AS body_1,
+                   min(p.caption) AS caption_1
+            FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
+                         (SELECT max(ts_rank(b.text_tsv, t.tsq))
+                            FROM corpus.content_block b
+                           WHERE b.article_id = a.id
+                             AND b.extraction_id = a.current_extraction_id
+                             AND b.text_tsv @@ t.tsq) AS body,
+                         (SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                            FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ t.tsq) AS caption
+                    FROM unnest(q.terms) AS t(tsq)
+                  OFFSET 0) p
+"""
+        concentration = """                  -- One term: q.tsq IS that term's tsquery, so tr already holds
+                  -- these two probes. CASE runs the ELSE subquery only when taken.
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.body_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
+                                          FROM corpus.content_block b
+                                         WHERE b.article_id = a.id
+                                           AND b.extraction_id = a.current_extraction_id
+                                           AND b.text_tsv @@ q.tsq), 0) END
+                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.caption_1, 0)
+                         ELSE coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
+                                          FROM corpus.article_image i
+                                         WHERE i.article_id = a.id
+                                           AND i.extraction_id = a.current_extraction_id
+                                           AND i.caption_tsv @@ q.tsq), 0) END"""
     cur.execute(f"""
-        WITH {CANDIDATES},
+        WITH {candidates},
         -- The accented query of each term, computed ONCE per search. It depends
         -- only on the query text, so evaluating corpus.accented_query() inside
         -- the per-article accent LATERAL below repeated the same PL/pgSQL call
@@ -549,7 +679,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                                     %(query)s)))               AS caption_rank,
                tr.term_rank,
                ar.accent_rank
-        FROM corpus.article a
+        FROM {source}
         -- The searchability gate, enforced in the schema rather than in a
         -- WHERE clause someone has to remember to write. See migrations/026.
         JOIN corpus.searchable_article sa ON sa.id = a.id
@@ -560,31 +690,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             -- over terms, so an article scores even when no single vector holds
             -- the whole query - which is every article the 012 fix recovered.
             --
-            -- The per-term block and caption probes run ONCE, in the subquery,
-            -- and the lone term's results are exposed as body_1/caption_1: for a
-            -- one-term query the concentration bonus in ORDER BY is the same
-            -- probe with the same tsquery, and it now reuses them instead of
-            -- scanning the article's blocks and captions a second time. OFFSET 0
-            -- keeps the planner from inlining the subquery, which would copy each
-            -- SubPlan into every aggregate that reads it. The sum adds the same
-            -- values in the same order as before.
-            SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0) AS term_rank,
-                   min(p.body)    AS body_1,
-                   min(p.caption) AS caption_1
-            FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
-                         (SELECT max(ts_rank(b.text_tsv, t.tsq))
-                            FROM corpus.content_block b
-                           WHERE b.article_id = a.id
-                             AND b.extraction_id = a.current_extraction_id
-                             AND b.text_tsv @@ t.tsq) AS body,
-                         (SELECT max(ts_rank(i.caption_tsv, t.tsq))
-                            FROM corpus.article_image i
-                           WHERE i.article_id = a.id
-                             AND i.extraction_id = a.current_extraction_id
-                             AND i.caption_tsv @@ t.tsq) AS caption
-                    FROM unnest(q.terms) AS t(tsq)
-                  OFFSET 0) p
-        ) tr
+{term_rank}        ) tr
         CROSS JOIN LATERAL (
             -- ACCENT BONUS. Rewards a document whose accents match the query's,
             -- which is the only thing that separates Viktor from Viktória -
@@ -609,7 +715,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   OFFSET 0) AS av(v)
             OFFSET 0
         ) ar
-        WHERE {MATCH_WHERE}
+        WHERE {where}
         ORDER BY (tr.term_rank
                   + ar.accent_rank
                   -- CONCENTRATION BONUS: the whole query satisfied by ONE
@@ -623,20 +729,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   -- 0.163-1.886, document-level hits 0.091-0.469, and they
                   -- interleave.
                   + ts_rank(a.search_tsv, q.tsq)
-                  -- One term: q.tsq IS that term's tsquery, so tr already holds
-                  -- these two probes. CASE runs the ELSE subquery only when taken.
-                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.body_1, 0)
-                         ELSE coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
-                                          FROM corpus.content_block b
-                                         WHERE b.article_id = a.id
-                                           AND b.extraction_id = a.current_extraction_id
-                                           AND b.text_tsv @@ q.tsq), 0) END
-                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.caption_1, 0)
-                         ELSE coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
-                                          FROM corpus.article_image i
-                                         WHERE i.article_id = a.id
-                                           AND i.extraction_id = a.current_extraction_id
-                                           AND i.caption_tsv @@ q.tsq), 0) END) DESC,
+{concentration}) DESC,
                  a.published_at DESC NULLS LAST,
                  -- Deterministic last resort. 'Magyarország' puts 82 articles
                  -- on one score and 63 on another, so without this the tail of
