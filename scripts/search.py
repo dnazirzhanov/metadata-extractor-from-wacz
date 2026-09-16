@@ -651,7 +651,12 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
             FROM q, unnest(q.raw_terms) WITH ORDINALITY AS t(term, ord))
         SELECT a.id, a.url_hash, a.title, a.subtitle, a.outlet, a.section,
                a.published_at, a.canonical_url, a.source_url, a.tags, a.authors,
-               e.extraction_status,
+               -- A subquery rather than a join: like body_rank and caption_rank
+               -- below, it is evaluated after the sort, for the page's rows only.
+               -- As a LEFT JOIN it was a primary-key lookup per candidate.
+               (SELECT e.extraction_status
+                  FROM corpus.article_extraction e
+                 WHERE e.id = a.current_extraction_id)     AS extraction_status,
                -- The complete match count, as a window over the same candidate
                -- set this query already scores and sorts before LIMIT/OFFSET -
                -- so a caller gets the total for free instead of matching_ids()
@@ -680,11 +685,12 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                tr.term_rank,
                ar.accent_rank
         FROM {source}
-        -- The searchability gate, enforced in the schema rather than in a
-        -- WHERE clause someone has to remember to write. See migrations/026.
-        JOIN corpus.searchable_article sa ON sa.id = a.id
+        -- The searchability gate (migrations/026) is enforced once, in the
+        -- candidate stage: every branch of CANDIDATES and ONE_TERM_CANDIDATES
+        -- joins corpus.searchable_article, and only a candidate is ranked.
+        -- Joining the view again here excluded nothing and cost a primary-key
+        -- lookup of the article and of its extraction per candidate.
         CROSS JOIN q
-        LEFT JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
         CROSS JOIN LATERAL (
             -- The BASE score: what each term is worth wherever it sits. Summed
             -- over terms, so an article scores even when no single vector holds
