@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -394,6 +395,44 @@ class TestRankingAndCitation:
         if not hits:
             pytest.skip("no hit for the query in this corpus")
         assert hits[0]["total_matches"] == len(S.matching_ids(cur, query))
+
+    def test_an_unsearchable_article_is_never_returned(self, cur, dcur):
+        """Migration 026's gate, end to end, on both candidate paths.
+
+        search_articles() enforces it only in the candidate stage, so an article
+        whose current reading is failed or holds no prose block must not come
+        back even for words from its own title - searched one word at a time
+        (ONE_TERM_CANDIDATES) and two at a time (CANDIDATES). Production has no
+        such article today; the development corpus does.
+        """
+        cur.execute("""
+            SELECT a.id, a.title FROM corpus.article a
+             WHERE a.id NOT IN (SELECT id FROM corpus.searchable_article)
+               AND coalesce(a.title, '') <> ''
+             ORDER BY a.id LIMIT 20""")
+        tried = 0
+        for article_id, title in cur.fetchall():
+            words = [w for w in re.findall(r"\w+", title) if len(w) >= 5]
+            for query in words[:1] + ([" ".join(words[:2])] if len(words) > 1 else []):
+                cur.execute("SELECT search_tsv @@ corpus.search_query(%s) FROM corpus.article WHERE id = %s",
+                            (query, article_id))
+                if not cur.fetchone()[0]:
+                    continue
+                tried += 1
+                assert article_id not in ids(dcur, query), (
+                    f"unsearchable article {article_id} returned for {query!r}")
+        if not tried:
+            pytest.skip("no unsearchable article matches its own title words in this corpus")
+
+    def test_a_hit_reports_its_current_readings_status(self, cur, dcur):
+        hits = S.search_articles(dcur, "kormány", limit=10)
+        if not hits:
+            pytest.skip("no hit for the query in this corpus")
+        for hit in hits:
+            cur.execute("""SELECT e.extraction_status FROM corpus.article a
+                             JOIN corpus.article_extraction e ON e.id = a.current_extraction_id
+                            WHERE a.id = %s""", (hit["id"],))
+            assert hit["extraction_status"] == cur.fetchone()[0]
 
     def test_a_body_hit_carries_a_citable_block(self, dcur):
         for hit in S.search_articles(dcur, "kormány", limit=25):
