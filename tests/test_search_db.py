@@ -361,6 +361,40 @@ class TestRankingAndCitation:
                         + hit["caption_rank"])
             assert hit["score"] == pytest.approx(expected)
 
+    @pytest.mark.parametrize("query", ["kormány", "kormány kormány"], ids=["one-term", "two-term"])
+    def test_term_rank_equals_its_per_article_definition(self, cur, dcur, query):
+        """term_rank must equal the per-article form; the repeated word exercises the multi-term path."""
+        hits = S.search_articles(dcur, query, limit=25)
+        if not hits:
+            pytest.skip("no hit for the query in this corpus")
+        for hit in hits:
+            cur.execute("""
+                SELECT coalesce(sum(ts_rank(a.search_tsv, t.tsq)
+                         + coalesce((SELECT max(ts_rank(b.text_tsv, t.tsq))
+                                       FROM corpus.content_block b
+                                      WHERE b.article_id = a.id
+                                        AND b.extraction_id = a.current_extraction_id
+                                        AND b.text_tsv @@ t.tsq), 0)
+                         + coalesce((SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                                       FROM corpus.article_image i
+                                      WHERE i.article_id = a.id
+                                        AND i.extraction_id = a.current_extraction_id
+                                        AND i.caption_tsv @@ t.tsq), 0)), 0)
+                  FROM corpus.article a, unnest(corpus.search_terms(%s)) AS t(tsq)
+                 WHERE a.id = %s""", (query, hit["id"]))
+            assert hit["term_rank"] == pytest.approx(cur.fetchone()[0], rel=1e-6)
+        for hi, lo in zip(hits, hits[1:]):
+            assert hi["score"] >= lo["score"] - max(abs(hi["score"]), 1.0) * 1e-6
+
+    @pytest.mark.parametrize("query", ["kormány", "kormány Zrínyi"], ids=["one-term", "two-term"])
+    def test_total_matches_equals_matching_ids(self, cur, dcur, query):
+        """A one-term search ranks ONE_TERM_CANDIDATES while matching_ids() reads
+        CANDIDATES: two definitions of one candidate set, so pin them together."""
+        hits = S.search_articles(dcur, query, limit=1)
+        if not hits:
+            pytest.skip("no hit for the query in this corpus")
+        assert hits[0]["total_matches"] == len(S.matching_ids(cur, query))
+
     def test_a_body_hit_carries_a_citable_block(self, dcur):
         for hit in S.search_articles(dcur, "kormány", limit=25):
             if hit["match_reason"] in ("body", "both"):
