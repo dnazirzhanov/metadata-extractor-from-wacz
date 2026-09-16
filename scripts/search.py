@@ -574,10 +574,9 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     require_supported_syntax(query)
     # The term count picks the candidate stage. One term ranks its matching
     # blocks and captions where it reads them (ONE_TERM_CANDIDATES). Any other
-    # count keeps CANDIDATES and the per-candidate probes, in fragments kept
-    # verbatim - including their now-unreached one-term CASE branches - so those
-    # searches send exactly the SQL they sent before. corpus.search_terms() is
-    # what the candidate stage unnests, so the count cannot disagree with it.
+    # count keeps CANDIDATES and ranks each candidate from ONE read of its blocks
+    # and captions (tr below). corpus.search_terms() is what the candidate stage
+    # unnests, so the count cannot disagree with it.
     cur.execute("SELECT cardinality(corpus.search_terms(%(query)s))",
                 {"query": query})
     if cur.fetchone()[0] == 1:
@@ -599,45 +598,49 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     else:
         candidates, where = CANDIDATES, MATCH_WHERE
         source = "corpus.article a"
-        term_rank = """            -- The per-term block and caption probes run ONCE, in the subquery,
-            -- and the lone term's results are exposed as body_1/caption_1: for a
-            -- one-term query the concentration bonus in ORDER BY is the same
-            -- probe with the same tsquery, and it now reuses them instead of
-            -- scanning the article's blocks and captions a second time. OFFSET 0
-            -- keeps the planner from inlining the subquery, which would copy each
-            -- SubPlan into every aggregate that reads it. The sum adds the same
-            -- values in the same order as before.
-            SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0) AS term_rank,
-                   min(p.body)    AS body_1,
-                   min(p.caption) AS caption_1
-            FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
-                         (SELECT max(ts_rank(b.text_tsv, t.tsq))
+        term_rank = """            -- Several terms: each candidate's current blocks and captions are read
+            -- ONCE, into r, and every rank is computed from those vectors - each
+            -- term's best block and caption for term_rank, and the whole query's
+            -- best for the concentration bonus in ORDER BY. As separate probes the
+            -- same ~15 blocks were fetched and re-tested once per term and once more
+            -- for the bonus: 4.9 s of the 10.2 s of 'Orban Viktor' (53,041 hits).
+            -- The values are the probes' own: the same rows (the article's current
+            -- extraction), the same ts_rank inputs, max() over the ones that match,
+            -- NULL where none does; the sum adds the terms in order, as before.
+            -- r's OFFSET 0 keeps the read from being inlined into each of its three
+            -- readers; the outer OFFSET 0 keeps tr one computed row for the SELECT
+            -- list and ORDER BY.
+            SELECT (SELECT coalesce(sum(p.meta + coalesce(p.body, 0) + coalesce(p.caption, 0)), 0)
+                      FROM (SELECT ts_rank(a.search_tsv, t.tsq) AS meta,
+                                   (SELECT max(ts_rank(v.tsv, t.tsq))
+                                      FROM unnest(r.blocks) AS v(tsv)
+                                     WHERE v.tsv @@ t.tsq) AS body,
+                                   (SELECT max(ts_rank(c.tsv, t.tsq))
+                                      FROM unnest(r.captions) AS c(tsv)
+                                     WHERE c.tsv @@ t.tsq) AS caption
+                              FROM unnest(q.terms) AS t(tsq)
+                            OFFSET 0) p) AS term_rank,
+                   (SELECT max(ts_rank(v.tsv, q.tsq))
+                      FROM unnest(r.blocks) AS v(tsv)
+                     WHERE v.tsv @@ q.tsq) AS q_body,
+                   (SELECT max(ts_rank(c.tsv, q.tsq))
+                      FROM unnest(r.captions) AS c(tsv)
+                     WHERE c.tsv @@ q.tsq) AS q_caption
+            FROM (SELECT (SELECT array_agg(b.text_tsv)
                             FROM corpus.content_block b
                            WHERE b.article_id = a.id
-                             AND b.extraction_id = a.current_extraction_id
-                             AND b.text_tsv @@ t.tsq) AS body,
-                         (SELECT max(ts_rank(i.caption_tsv, t.tsq))
+                             AND b.extraction_id = a.current_extraction_id) AS blocks,
+                         (SELECT array_agg(i.caption_tsv)
                             FROM corpus.article_image i
                            WHERE i.article_id = a.id
-                             AND i.extraction_id = a.current_extraction_id
-                             AND i.caption_tsv @@ t.tsq) AS caption
-                    FROM unnest(q.terms) AS t(tsq)
-                  OFFSET 0) p
+                             AND i.extraction_id = a.current_extraction_id) AS captions
+                  OFFSET 0) r
+            OFFSET 0
 """
-        concentration = """                  -- One term: q.tsq IS that term's tsquery, so tr already holds
-                  -- these two probes. CASE runs the ELSE subquery only when taken.
-                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.body_1, 0)
-                         ELSE coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq))
-                                          FROM corpus.content_block b
-                                         WHERE b.article_id = a.id
-                                           AND b.extraction_id = a.current_extraction_id
-                                           AND b.text_tsv @@ q.tsq), 0) END
-                  + CASE WHEN cardinality(q.terms) = 1 THEN coalesce(tr.caption_1, 0)
-                         ELSE coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq))
-                                          FROM corpus.article_image i
-                                         WHERE i.article_id = a.id
-                                           AND i.extraction_id = a.current_extraction_id
-                                           AND i.caption_tsv @@ q.tsq), 0) END"""
+        concentration = """                  -- Several terms: the whole query's best block and caption rank,
+                  -- from the same single read of the candidate's rows (tr).
+                  + coalesce(tr.q_body, 0)
+                  + coalesce(tr.q_caption, 0)"""
     cur.execute(f"""
         WITH {candidates},
         -- The accented query of each term, computed ONCE per search. It depends

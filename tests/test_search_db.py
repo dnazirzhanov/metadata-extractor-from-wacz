@@ -362,7 +362,8 @@ class TestRankingAndCitation:
                         + hit["caption_rank"])
             assert hit["score"] == pytest.approx(expected)
 
-    @pytest.mark.parametrize("query", ["kormány", "kormány kormány"], ids=["one-term", "two-term"])
+    @pytest.mark.parametrize("query", ["kormány", "kormány kormány", "Orbán Viktor"],
+                             ids=["one-term", "two-term", "two-words"])
     def test_term_rank_equals_its_per_article_definition(self, cur, dcur, query):
         """term_rank must equal the per-article form; the repeated word exercises the multi-term path."""
         hits = S.search_articles(dcur, query, limit=25)
@@ -386,6 +387,57 @@ class TestRankingAndCitation:
             assert hit["term_rank"] == pytest.approx(cur.fetchone()[0], rel=1e-6)
         for hi, lo in zip(hits, hits[1:]):
             assert hi["score"] >= lo["score"] - max(abs(hi["score"]), 1.0) * 1e-6
+
+    #: The ranked query's ORDER BY value, rebuilt per article from the definitions
+    #: rather than from search.py's SQL: term_rank + accent_rank + the metadata
+    #: rank + the concentration bonus (the whole query's best block and caption),
+    #: added in the same order, as real, so the result is bit-comparable.
+    ORDER_VALUE = """
+        WITH q AS (SELECT corpus.search_query(%(q)s) AS tsq, corpus.search_terms(%(q)s) AS terms,
+                          regexp_split_to_array(corpus.collapse_whitespace(%(q)s), '[ -]+') AS raw)
+        SELECT a.id, a.published_at,
+               ((SELECT coalesce(sum(ts_rank(a.search_tsv, t.tsq)
+                          + coalesce((SELECT max(ts_rank(b.text_tsv, t.tsq)) FROM corpus.content_block b
+                                       WHERE b.article_id = a.id AND b.extraction_id = a.current_extraction_id
+                                         AND b.text_tsv @@ t.tsq), 0)
+                          + coalesce((SELECT max(ts_rank(i.caption_tsv, t.tsq)) FROM corpus.article_image i
+                                       WHERE i.article_id = a.id AND i.extraction_id = a.current_extraction_id
+                                         AND i.caption_tsv @@ t.tsq), 0) ORDER BY t.ord), 0)
+                   FROM unnest(q.terms) WITH ORDINALITY AS t(tsq, ord))
+                + (SELECT coalesce(sum(ts_rank(to_tsvector('corpus.hungarian_lemma',
+                                                   concat_ws(' ', a.title, a.subtitle, a.description)),
+                                               corpus.accented_query(r.term)) ORDER BY r.ord), 0)
+                     FROM unnest(q.raw) WITH ORDINALITY AS r(term, ord))
+                + ts_rank(a.search_tsv, q.tsq)
+                + coalesce((SELECT max(ts_rank(b.text_tsv, q.tsq)) FROM corpus.content_block b
+                             WHERE b.article_id = a.id AND b.extraction_id = a.current_extraction_id
+                               AND b.text_tsv @@ q.tsq), 0)
+                + coalesce((SELECT max(ts_rank(i.caption_tsv, q.tsq)) FROM corpus.article_image i
+                             WHERE i.article_id = a.id AND i.extraction_id = a.current_extraction_id
+                               AND i.caption_tsv @@ q.tsq), 0)) AS value
+          FROM corpus.article a, q
+         WHERE a.id = ANY(%(ids)s)"""
+
+    @pytest.mark.parametrize("query", ["Orbán Viktor", "orosz elnök", "kormány"])
+    def test_a_page_is_in_the_order_of_its_per_article_score(self, cur, dcur, query):
+        """The concentration bonus is not a column: only ORDER BY sees it. So rebuild
+        each hit's whole ORDER BY value from its per-article definition and require
+        the page to come back in exactly that order - (value DESC, published_at
+        DESC NULLS LAST, id) - on the first page and on the last."""
+        first = S.search_articles(dcur, query, limit=25)
+        if len(first) < 2:
+            pytest.skip("corpus too small to order")
+        last = S.search_articles(dcur, query, limit=25,
+                                 offset=max(first[0]["total_matches"] - 25, 0))
+        for hits in (first, last):
+            ids = [h["id"] for h in hits]
+            cur.execute(self.ORDER_VALUE, {"q": query, "ids": ids})
+            value = {i: (v, published) for i, published, v in cur.fetchall()}
+            # value DESC, published_at DESC NULLS LAST, id
+            expected = sorted(ids, key=lambda i: (-value[i][0],
+                                                  -value[i][1].timestamp() if value[i][1] else float("inf"),
+                                                  i))
+            assert ids == expected, f"{query!r}: page order differs from the per-article score order"
 
     @pytest.mark.parametrize("query", ["kormány", "kormány Zrínyi"], ids=["one-term", "two-term"])
     def test_total_matches_equals_matching_ids(self, cur, dcur, query):
