@@ -243,6 +243,172 @@ class TestConjunctionAndPhrase:
             assert strict <= loose, query
 
 
+class _RankedSQL:
+    """A cursor for search_articles() that runs the term count and records the
+    ranked statement - raw and rendered - instead of running it."""
+
+    def __init__(self, cur):
+        self.cur, self.raw, self.rendered = cur, None, None
+
+    def execute(self, sql, params=None):
+        if "OFFSET %(offset)s" in sql:
+            self.raw, self.rendered = sql, self.cur.mogrify(sql, params).decode()
+        else:
+            self.cur.execute(sql, params)
+
+    def fetchone(self):
+        return self.cur.fetchone()
+
+    def fetchall(self):
+        return []
+
+
+class TestSetBasedPhraseCheck:
+    """PHRASE_HIT_SET_BASED: a phrase search without filters tests paragraphs as
+    one set per search. It must answer exactly what the per-candidate PHRASE_HIT
+    answers, and it must really run as one set - the reason it exists."""
+
+    @pytest.mark.parametrize("query", ["Orbán Viktor", "Magyarország kormánya", "orosz elnök", "Zrínyi Miklós"])
+    def test_both_phrase_checks_return_the_same_articles(self, cur, query):
+        """The unfiltered result (set-based) against the per-candidate form, forced
+        by an outlet filter: the per-outlet results over every outlet the
+        candidates come from, united, must be the unfiltered result exactly."""
+        loose = S.matching_ids(cur, query)
+        if not loose:
+            pytest.skip("no candidate for the query in this corpus")
+        set_based = S.matching_ids(cur, query, phrase=True)
+        cur.execute("SELECT DISTINCT outlet FROM corpus.article WHERE id = ANY(%s)", (sorted(loose),))
+        per_candidate = set()
+        for (outlet,) in cur.fetchall():
+            per_candidate |= S.matching_ids(cur, query, phrase=True, outlet=outlet)
+        assert set_based == per_candidate
+
+    def test_an_unfiltered_phrase_search_tests_paragraphs_as_one_set(self, cur):
+        """Only the plan shows the difference: a paragraph subquery made correlated
+        again (q.tsq instead of the query literal) returns the same rows, once per
+        candidate. Unfiltered must plan a hashed SubPlan; a filtered search must
+        still send the per-candidate PHRASE_HIT."""
+        unfiltered, filtered = _RankedSQL(cur), _RankedSQL(cur)
+        S.search_articles(unfiltered, "orosz elnök", limit=20, phrase=True)
+        S.search_articles(filtered, "orosz elnök", limit=20, phrase=True, date_from="2020-01-01")
+        assert S.PHRASE_HIT_SET_BASED in unfiltered.raw and S.PHRASE_HIT not in unfiltered.raw
+        assert S.PHRASE_HIT in filtered.raw and S.PHRASE_HIT_SET_BASED not in filtered.raw
+        cur.execute("EXPLAIN " + unfiltered.rendered)
+        plan = "\n".join(row[0] for row in cur.fetchall())
+        assert "hashed SubPlan" in plan, plan
+
+    def test_only_the_set_based_statement_runs_with_parallel_settings(self):
+        """SET_BASED_PHRASE_SETTINGS must be in force for the statement that builds
+        the set - the ranked query and matching_ids() of an unfiltered phrase search -
+        and for no other: not for a filtered phrase search, not for a search without
+        --phrase, and no longer once the call returns (the passage queries and the
+        caller's next statement run with their own settings). The plan it gives
+        depends on the corpus, so this pins the settings, not the plan. Its own
+        connection, so a setting another test's search left behind cannot hide one
+        this test's search leaves behind; it only reads."""
+        conn = S.connect(DSN)
+        cur = conn.cursor()
+        names = [name for name, _ in S.SET_BASED_PHRASE_SETTINGS]
+        forced = dict(S.SET_BASED_PHRASE_SETTINGS)
+
+        def current():
+            cur.execute("SELECT " + ", ".join("current_setting(%s)" for _ in names), names)
+            return dict(zip(names, cur.fetchone()))
+
+        class SettingsAtStatement:
+            """Runs everything but the set-building statement, and records the settings in force when that comes."""
+
+            def __init__(self):
+                self.seen = []
+
+            def execute(self, sql, params=None):
+                if "OFFSET %(offset)s" in sql or "JOIN corpus.searchable_article sa ON sa.id = a.id" in sql:
+                    self.seen.append(current())
+                else:
+                    cur.execute(sql, params)
+
+            def fetchone(self):
+                return cur.fetchone()
+
+            def fetchall(self):
+                return []
+
+        try:
+            defaults = current()
+            assert defaults != forced, "the server already runs with the forced settings; nothing to tell apart"
+            cases = [({"phrase": True}, forced),
+                     ({"phrase": True, "date_from": "2020-01-01"}, defaults),
+                     ({"phrase": False}, defaults)]
+            for kwargs, expected in cases:
+                for call in (lambda c: S.search_articles(c, "orosz elnök", limit=20, **kwargs),
+                             lambda c: S.matching_ids(c, "orosz elnök", **kwargs)):
+                    recorder = SettingsAtStatement()
+                    call(recorder)
+                    assert recorder.seen == [expected], f"{kwargs}: settings at the statement"
+                    assert current() == defaults, f"{kwargs}: settings not restored after the call"
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def test_a_phrase_only_in_an_older_reading_is_not_found(self):
+        """The set is (article, reading) pairs. A phrase whose words are adjacent
+        only in an older reading - and apart in the current one - must not make the
+        article a phrase hit, on either form, while a phrase adjacent in the current
+        reading must. No database here holds an older reading's paragraphs, so the
+        article is built on a connection of its own and rolled back; on a read-only
+        database the test skips."""
+        first, second, third, fourth = "kvarcpipacs", "zafírgereblye", "opálfurulya", "rubinkaptár"
+        older_text = f"{first} {second} egy mondatban"
+        current_text = f"{second} egy mondat, majd jóval később {first}, végül {third} {fourth} is."
+        conn = S.connect(DSN)
+        try:
+            c = conn.cursor()
+            dc = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            c.execute("SHOW transaction_read_only")
+            if c.fetchone()[0] == "on":
+                pytest.skip("read-only database: the fixture cannot be written")
+            for word in (first, second, third, fourth):
+                assert not S.matching_ids(c, word), f"{word!r} already matches this corpus"
+            phrase, control = f"{first} {second}", f"{third} {fourth}"
+            # Not vacuous: adjacent in the older reading only; the control is adjacent now.
+            assert matches_phrase(c, older_text, phrase) and not matches_phrase(c, current_text, phrase)
+            assert matches_phrase(c, current_text, control)
+
+            c.execute("""
+                WITH u AS (INSERT INTO urls (url_hash, url, outlet)
+                           VALUES ('test-phrase-reading', 'https://phrase-reading.invalid/', 'test')
+                           RETURNING url_hash)
+                INSERT INTO corpus.article (url_hash, outlet, source_url, title)
+                SELECT url_hash, 'test', 'https://phrase-reading.invalid/', 'Próbacikk' FROM u
+                RETURNING id""")
+            article_id = c.fetchone()[0]
+            reading = {}
+            for name, current in (("older", False), ("current", True)):
+                c.execute("""
+                    INSERT INTO corpus.article_extraction (article_id, extractor_version, extraction_status,
+                                                           extracted_at, is_current, content_block_count)
+                    VALUES (%s, 'test', 'success', now(), %s, 1) RETURNING id""", (article_id, current))
+                reading[name] = c.fetchone()[0]
+            c.execute("""
+                INSERT INTO corpus.content_block (extraction_id, article_id, block_index, block_type, xpath, block_text)
+                VALUES (%s, %s, 0, 'paragraph', '/html/body/p[1]', %s),
+                       (%s, %s, 0, 'paragraph', '/html/body/p[1]', %s)""",
+                      (reading["older"], article_id, older_text, reading["current"], article_id, current_text))
+            c.execute("UPDATE corpus.article SET current_extraction_id = %s WHERE id = %s",
+                      (reading["current"], article_id))
+
+            for filters in ({}, {"outlet": "test"}):          # set-based, then per-candidate
+                form = "filtered" if filters else "unfiltered"
+                assert article_id in S.matching_ids(c, phrase, **filters), f"{form}: not even a candidate"
+                assert article_id not in S.matching_ids(c, phrase, phrase=True, **filters), f"{form}: matching_ids()"
+                assert article_id not in ids(dc, phrase, phrase=True, **filters), f"{form}: search_articles()"
+                assert article_id in S.matching_ids(c, control, phrase=True, **filters), f"{form}: control"
+                assert article_id in ids(dc, control, phrase=True, **filters), f"{form}: control, ranked"
+        finally:
+            conn.rollback()
+            conn.close()
+
+
 class TestFilters:
     """The filter paths dev_validate.py never exercises.
 
