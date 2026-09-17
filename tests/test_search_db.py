@@ -476,6 +476,88 @@ class TestRankingAndCitation:
         if not tried:
             pytest.skip("no unsearchable article matches its own title words in this corpus")
 
+    def test_an_older_reading_neither_matches_nor_ranks(self):
+        """The gate keeps only the CURRENT reading's blocks and captions, on both
+        candidate paths, and ONE_TERM_CANDIDATES ranks the rows it reads - so a
+        block of an older reading must neither make an article a candidate nor
+        lend it a rank.
+
+        No database here holds such a block (production, development and CI keep
+        one reading's blocks per article), so the article is built: an older
+        reading whose block and caption hold both words, the shared one three
+        times, and a current reading holding the shared word once in a longer
+        paragraph. It is written on a connection of its own and rolled back; on a
+        read-only database the test skips.
+        """
+        older_word, shared = "zafírgereblye", "kvarcpipacs"
+        conn = S.connect(DSN)
+        try:
+            c = conn.cursor()
+            dc = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            c.execute("SHOW transaction_read_only")
+            if c.fetchone()[0] == "on":
+                pytest.skip("read-only database: the fixture cannot be written")
+            for word in (older_word, shared):
+                assert matches(c, f"{shared} {older_word}", word), f"{word!r} is not a searchable word"
+                assert not ids(dc, word), f"{word!r} already matches this corpus"
+
+            c.execute("""
+                WITH u AS (INSERT INTO urls (url_hash, url, outlet)
+                           VALUES ('test-older-reading', 'https://older-reading.invalid/', 'test')
+                           RETURNING url_hash)
+                INSERT INTO corpus.article (url_hash, outlet, source_url, title)
+                SELECT url_hash, 'test', 'https://older-reading.invalid/', 'Próbacikk' FROM u
+                RETURNING id""")
+            article_id = c.fetchone()[0]
+            reading = {}
+            for name, current in (("older", False), ("current", True)):
+                c.execute("""
+                    INSERT INTO corpus.article_extraction (article_id, extractor_version, extraction_status,
+                                                           extracted_at, is_current, content_block_count)
+                    VALUES (%s, 'test', 'success', now(), %s, 1) RETURNING id""", (article_id, current))
+                reading[name] = c.fetchone()[0]
+            c.execute("""
+                INSERT INTO corpus.content_block (extraction_id, article_id, block_index, block_type, xpath, block_text)
+                VALUES (%s, %s, 0, 'paragraph', '/html/body/p[1]', %s),
+                       (%s, %s, 0, 'paragraph', '/html/body/p[1]', %s)""",
+                      (reading["older"], article_id, f"{shared} {shared} {shared} {older_word}",
+                       reading["current"], article_id,
+                       f"A {shared} szó egyszer szerepel ebben a hosszabb, új bekezdésben."))
+            c.execute("""
+                INSERT INTO corpus.article_image (article_id, extraction_id, local_ref, is_available, caption)
+                VALUES (%s, %s, 'img-1', true, %s)""", (article_id, reading["older"], f"{shared} {older_word}"))
+            c.execute("UPDATE corpus.article SET current_extraction_id = %s WHERE id = %s",
+                      (reading["current"], article_id))
+
+            # Not vacuous: ranking the older block would change the score.
+            c.execute("""
+                SELECT ts_rank(b.text_tsv, corpus.search_query(%s)) FROM corpus.content_block b
+                 WHERE b.article_id = %s ORDER BY b.extraction_id = %s""",
+                      (shared, article_id, reading["current"]))
+            older_rank, current_rank = (r[0] for r in c.fetchall())
+            assert older_rank > current_rank
+
+            # One term, then two (ONE_TERM_CANDIDATES, then CANDIDATES), then matching_ids().
+            for query in (older_word, f"{shared} {older_word}"):
+                assert article_id not in ids(dc, query), f"returned for {query!r} from its older reading"
+            for query in (older_word, f"{shared} {older_word}"):
+                assert article_id not in S.matching_ids(c, query), f"matching_ids() has it for {query!r}"
+
+            hits = [h for h in S.search_articles(dc, shared, limit=100) if h["id"] == article_id]
+            assert len(hits) == 1, "the current reading's own word must find the article, once"
+            # Both readings hold the shared word, so on the two-term path both (article, reading) groups pass the
+            # term count; the gate must keep one, and joining the candidates to their articles must not repeat it.
+            twice = [h for h in S.search_articles(dc, f"{shared} {shared}", limit=100) if h["id"] == article_id]
+            assert len(twice) == 1, "a two-term search must find the article, once"
+            c.execute("SELECT ts_rank(search_tsv, corpus.search_query(%s)) FROM corpus.article WHERE id = %s",
+                      (shared, article_id))
+            meta_rank = c.fetchone()[0]
+            assert hits[0]["term_rank"] == pytest.approx(meta_rank + current_rank, rel=1e-6)
+            assert hits[0]["total_matches"] == len(S.matching_ids(c, shared))
+        finally:
+            conn.rollback()
+            conn.close()
+
     def test_a_hit_reports_its_current_readings_status(self, cur, dcur):
         hits = S.search_articles(dcur, "kormány", limit=10)
         if not hits:
