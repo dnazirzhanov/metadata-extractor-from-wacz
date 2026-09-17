@@ -148,6 +148,33 @@ META_HIT = (
 #:
 #: Zero terms (an empty query, or one that is all stopwords) yields no rows and
 #: therefore matches nothing, which is what corpus.search_query already answered.
+#:
+#: The searchability gate (migration 026) runs ONCE PER CANDIDATE, after the
+#: terms are intersected - not on every matching row of every branch. Gated in
+#: the branches it was a lookup per matching block: 'kormány Zrínyi' checked
+#: 305,772 kormány blocks and 44,764 metadata hits for 163 results, ~1.2 s of
+#: its 2.3 s, and a rare word paid a hash of all 413,802 extractions (Zrínyi
+#: ~0.2 s of 0.26 s). Each branch now yields the reading its row belongs to -
+#: the block's or caption's extraction, and for a metadata hit the article's
+#: current one - and the groups are keyed by (article, reading). The gate keeps
+#: the group whose reading is the article's current one, of a searchable article:
+#:   - that group holds exactly the rows the per-branch gate kept - the metadata
+#:     hit and the current reading's blocks and captions - so its term count,
+#:     and in ONE_TERM_CANDIDATES its max() ranks, are the gated rows' own;
+#:   - a group of an older reading, or of an article that is not searchable, is
+#:     dropped whole, whatever it matched;
+#:   - so an article comes back at most once: only one reading is current.
+#: The join is the gate's own predicate - sa.id = article and
+#: sa.current_extraction_id = reading - moved, not changed.
+#:
+#: The groups are ORDERED BY article before the gate, and that order is load-
+#: bearing for speed only. A hashed GROUP BY emits its groups in hash order, and
+#: every per-candidate index lookup after it - the gate's, the article row, the
+#: ranking reads - then lands on a random page: measured 2026-09-17, 'kormány'
+#: made 298,624 gate lookups at 5-6 us each where the per-branch gate, fed in
+#: scan order, paid ~2 us - the same buffer hits, all in memory - and the search
+#: went from 7.1 to 8.2 s. The final ORDER BY decides the result; this one only
+#: decides which pages the next lookup touches.
 QUERY_CTE = """
         q AS (SELECT corpus.search_query(%(query)s) AS tsq,
                      corpus.search_terms(%(query)s) AS terms,
@@ -156,39 +183,40 @@ QUERY_CTE = """
                          corpus.collapse_whitespace(%(query)s), '[ -]+') AS raw_terms),"""
 CANDIDATES = QUERY_CTE + """
         doc AS (
-            SELECT m.article_id
-            FROM q,
-                 unnest(q.terms) WITH ORDINALITY AS t(tsq, ord),
-                 LATERAL (
-                     -- Every branch goes through corpus.searchable_article
-                     -- (migration 026). The block and caption branches were
-                     -- already scoped to the current extraction; THE METADATA
-                     -- BRANCH WAS NOT, and that was the hole: an article whose
-                     -- current reading is `failed`, or which produced no prose
-                     -- block at all, still matched on its title, subtitle,
-                     -- description, authors and tags, and answered a search
-                     -- with no citable passage behind it.
-                     SELECT a2.id AS article_id
-                       FROM corpus.article a2
-                       JOIN corpus.searchable_article sa ON sa.id = a2.id
-                      WHERE a2.search_tsv @@ t.tsq
-                     UNION
-                     SELECT b.article_id
-                       FROM corpus.content_block b
-                       JOIN corpus.searchable_article a3 ON a3.id = b.article_id
-                      WHERE b.extraction_id = a3.current_extraction_id
-                        AND b.text_tsv @@ t.tsq
-                     UNION
-                     SELECT i.article_id
-                       FROM corpus.article_image i
-                       JOIN corpus.searchable_article a4 ON a4.id = i.article_id
-                      WHERE i.extraction_id = a4.current_extraction_id
-                        AND i.caption_tsv @@ t.tsq
-                        -- the partial caption index's own predicate; an empty vector matches no term
-                        AND i.caption_tsv <> ''
-                 ) m
-            GROUP BY m.article_id
-            HAVING count(DISTINCT t.ord) = (SELECT cardinality(terms) FROM q)
+            SELECT g.article_id
+            FROM (SELECT m.article_id, m.extraction_id
+                    FROM q,
+                         unnest(q.terms) WITH ORDINALITY AS t(tsq, ord),
+                         LATERAL (
+                             -- Each hit with the reading it belongs to; the metadata
+                             -- hit belongs to the article's current reading.
+                             SELECT a2.id AS article_id,
+                                    a2.current_extraction_id AS extraction_id
+                               FROM corpus.article a2
+                              WHERE a2.search_tsv @@ t.tsq
+                             UNION
+                             SELECT b.article_id, b.extraction_id
+                               FROM corpus.content_block b
+                              WHERE b.text_tsv @@ t.tsq
+                             UNION
+                             SELECT i.article_id, i.extraction_id
+                               FROM corpus.article_image i
+                              WHERE i.caption_tsv @@ t.tsq
+                                -- the partial caption index's own predicate; an empty vector matches no term
+                                AND i.caption_tsv <> ''
+                         ) m
+                   GROUP BY m.article_id, m.extraction_id
+                  HAVING count(DISTINCT t.ord) = (SELECT cardinality(terms) FROM q)
+                  -- article order for the lookups below (see above); not the result order
+                  ORDER BY m.article_id) g
+            -- The gate (migration 026), once per candidate. It covers the metadata
+            -- hit too, and that was the hole it closed: an article whose current
+            -- reading is `failed`, or which produced no prose block at all, still
+            -- matched on its title, subtitle, description, authors and tags, and
+            -- answered a search with no citable passage behind it.
+            JOIN corpus.searchable_article sa
+              ON sa.id = g.article_id
+             AND sa.current_extraction_id = g.extraction_id
         )"""
 
 #: CANDIDATES for a query of exactly ONE term, carrying forward what ranking
@@ -221,33 +249,36 @@ CANDIDATES = QUERY_CTE + """
 #: the intersection.
 ONE_TERM_CANDIDATES = QUERY_CTE + """
         doc AS (
-            SELECT h.article_id,
-                   max(h.body)    AS body,
-                   max(h.caption) AS caption
-            FROM q,
-                 unnest(q.terms) AS t(tsq),
-                 LATERAL (
-                     -- The branches, joins and filters of CANDIDATES.
-                     SELECT a2.id AS article_id,
-                            NULL::real AS body, NULL::real AS caption
-                       FROM corpus.article a2
-                       JOIN corpus.searchable_article sa ON sa.id = a2.id
-                      WHERE a2.search_tsv @@ t.tsq
-                     UNION ALL
-                     SELECT b.article_id, ts_rank(b.text_tsv, t.tsq), NULL
-                       FROM corpus.content_block b
-                       JOIN corpus.searchable_article a3 ON a3.id = b.article_id
-                      WHERE b.extraction_id = a3.current_extraction_id
-                        AND b.text_tsv @@ t.tsq
-                     UNION ALL
-                     SELECT i.article_id, NULL, ts_rank(i.caption_tsv, t.tsq)
-                       FROM corpus.article_image i
-                       JOIN corpus.searchable_article a4 ON a4.id = i.article_id
-                      WHERE i.extraction_id = a4.current_extraction_id
-                        AND i.caption_tsv @@ t.tsq
-                        AND i.caption_tsv <> ''
-                 ) h
-            GROUP BY h.article_id
+            SELECT g.article_id, g.body, g.caption
+            FROM (SELECT h.article_id, h.extraction_id,
+                         max(h.body)    AS body,
+                         max(h.caption) AS caption
+                    FROM q,
+                         unnest(q.terms) AS t(tsq),
+                         LATERAL (
+                             -- The branches of CANDIDATES, ranked where they are read.
+                             SELECT a2.id AS article_id,
+                                    a2.current_extraction_id AS extraction_id,
+                                    NULL::real AS body, NULL::real AS caption
+                               FROM corpus.article a2
+                              WHERE a2.search_tsv @@ t.tsq
+                             UNION ALL
+                             SELECT b.article_id, b.extraction_id, ts_rank(b.text_tsv, t.tsq), NULL
+                               FROM corpus.content_block b
+                              WHERE b.text_tsv @@ t.tsq
+                             UNION ALL
+                             SELECT i.article_id, i.extraction_id, NULL, ts_rank(i.caption_tsv, t.tsq)
+                               FROM corpus.article_image i
+                              WHERE i.caption_tsv @@ t.tsq
+                                AND i.caption_tsv <> ''
+                         ) h
+                   GROUP BY h.article_id, h.extraction_id
+                   -- article order for the lookups below; not the result order
+                   ORDER BY h.article_id) g
+            -- The gate of CANDIDATES, once per (article, reading).
+            JOIN corpus.searchable_article sa
+              ON sa.id = g.article_id
+             AND sa.current_extraction_id = g.extraction_id
         )"""
 
 #: The phrase recheck, unchanged in meaning and now stated once.
@@ -282,8 +313,8 @@ PHRASE_HIT = ("""(
 #: Two copies of a WHERE clause is how a ranked result list and the recall set
 #: measured against it quietly stop meaning the same thing - the same argument
 #: that put the ingestion INSERTs in one module (scripts/cx_ingest.py).
-#: MATCH_FILTERS is everything but candidate membership: a one-term search gets
-#: membership by joining ONE_TERM_CANDIDATES' `doc`, every other search and
+#: MATCH_FILTERS is everything but candidate membership: search_articles() gets
+#: membership by joining `doc` (ONE_TERM_CANDIDATES' or CANDIDATES'), and
 #: matching_ids() by MATCH_WHERE's IN - the same filters either way, written once.
 #: Expects the CTEs in CANDIDATES, and the same parameter names.
 MATCH_FILTERS = ("""(NOT %(phrase)s OR """ + PHRASE_HIT + """)
@@ -577,11 +608,19 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     # count keeps CANDIDATES and ranks each candidate from ONE read of its blocks
     # and captions (tr below). corpus.search_terms() is what the candidate stage
     # unnests, so the count cannot disagree with it.
+    #
+    # Both stages end in the gate, which leaves at most one row per article, so
+    # the candidates are JOINED to their articles rather than tested with IN.
+    # IN could not see that uniqueness through the gate's join and de-duplicated
+    # with a hash, whose output order sent every per-candidate lookup after it to
+    # a random page (Orban Viktor's ranking reads 2.0 -> 2.6 s, 2026-09-17). The
+    # join keeps the candidates in article order.
+    source = "doc d\n        JOIN corpus.article a ON a.id = d.article_id"
+    where = MATCH_FILTERS
     cur.execute("SELECT cardinality(corpus.search_terms(%(query)s))",
                 {"query": query})
     if cur.fetchone()[0] == 1:
-        candidates, where = ONE_TERM_CANDIDATES, MATCH_FILTERS
-        source = "doc d\n        JOIN corpus.article a ON a.id = d.article_id"
+        candidates = ONE_TERM_CANDIDATES
         term_rank = """            -- One term: its best block and caption rank were computed where the
             -- candidate stage read the matching rows (ONE_TERM_CANDIDATES), and
             -- arrive as d.body and d.caption. This is the probe form's sum over
@@ -596,8 +635,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   + coalesce(d.body, 0)
                   + coalesce(d.caption, 0)"""
     else:
-        candidates, where = CANDIDATES, MATCH_WHERE
-        source = "corpus.article a"
+        candidates = CANDIDATES
         term_rank = """            -- Several terms: each candidate's current blocks and captions are read
             -- ONCE, into r, and every rank is computed from those vectors - each
             -- term's best block and caption for term_rank, and the whole query's
@@ -698,8 +736,8 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                ar.accent_rank
         FROM {source}
         -- The searchability gate (migrations/026) is enforced once, in the
-        -- candidate stage: every branch of CANDIDATES and ONE_TERM_CANDIDATES
-        -- joins corpus.searchable_article, and only a candidate is ranked.
+        -- candidate stage: CANDIDATES and ONE_TERM_CANDIDATES both end in a join
+        -- to corpus.searchable_article, and only a candidate is ranked.
         -- Joining the view again here excluded nothing and cost a primary-key
         -- lookup of the article and of its extraction per candidate.
         CROSS JOIN q
