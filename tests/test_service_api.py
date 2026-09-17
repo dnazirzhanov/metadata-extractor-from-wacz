@@ -253,6 +253,49 @@ class TestArchiveReplay:
         assert client.get("/articles/99999999/page.wacz").status_code == 404
 
 
+class TestResolve:
+    """A link inside a replay opens our capture of its target - that article exactly, or nothing."""
+
+    def test_resolve_is_documented(self, client):
+        assert "/resolve" in client.get("/openapi.json").json()["paths"]
+
+    def test_an_article_url_resolves_to_that_article(self, client, capture):
+        article_id, info = capture
+        r = client.get("/resolve", params={"url": info["page_url"]})
+        assert r.status_code == 200, r.text
+        assert r.json()["article"]["id"] == article_id
+
+    def test_the_ways_a_link_can_differ_from_the_archived_url_still_resolve(self, client, capture):
+        """What a link on the page may add or change without being another page."""
+        from urllib.parse import urlsplit, urlunsplit
+        article_id, info = capture
+        p = urlsplit(info["page_url"])
+        tracking = (p.query + "&" if p.query else "") + "utm_source=facebook&fbclid=x"
+        for variant in (
+            urlunsplit((p.scheme, p.netloc, p.path.rstrip("/") + "/", p.query, "comments")),
+            urlunsplit((p.scheme, p.netloc, p.path, tracking, "")),
+            urlunsplit(("http", p.netloc, p.path, p.query, "")),
+            urlunsplit((p.scheme, "www." + p.netloc.removeprefix("www."), p.path, p.query, "")),
+        ):
+            r = client.get("/resolve", params={"url": variant})
+            assert r.status_code == 200, variant
+            assert r.json()["article"]["id"] == article_id, variant
+
+    def test_another_page_on_the_same_site_does_not_resolve_to_it(self, client, capture):
+        _, info = capture
+        p = info["page_url"].rstrip("/")
+        for other in (p + "-2", p.rsplit("/", 1)[0], p + "/comments"):
+            assert client.get("/resolve", params={"url": other}).status_code == 404, other
+
+    def test_a_page_we_do_not_hold_is_404(self, client):
+        r = client.get("/resolve", params={"url": "https://example.invalid/2024/01/nothing-here"})
+        assert r.status_code == 404
+
+    def test_only_an_absolute_web_url_is_asked(self, client):
+        for bad in ("javascript:alert(1)", "/belfold/2024/01/relative", "mailto:a@b.hu", "https://", ""):
+            assert client.get("/resolve", params={"url": bad}).status_code in (400, 422), bad
+
+
 class TestUI:
     def test_the_search_page_and_its_script_are_served(self, client):
         page = client.get("/")
@@ -265,15 +308,23 @@ class TestUI:
         for path in ("/", "/static/app.js", "/static/app.css"):
             assert client.get(path).headers.get("cache-control") == "no-cache", path
 
-    def test_the_script_the_replay_worker_injects_exists(self, client):
-        """app.js names the guard only inside the worker URL; renaming one side would
-        silently bring back the page-wiping anti-adblock redirect in every replay."""
+    def test_the_scripts_the_replay_worker_injects_exist(self, client):
+        """app.js names these only inside the worker URL; renaming one side would silently
+        bring back the page-wiping anti-adblock redirect, or dead links, in every replay."""
         app_js = client.get("/static/app.js").text
         injected = re.search(r"injectScripts=([^&\"]+)", app_js)
         assert injected, "app.js no longer asks the replay worker to inject anything"
-        r = client.get(injected.group(1))
-        assert r.status_code == 200
-        assert "javascript" in r.headers["content-type"]
+        scripts = injected.group(1).split(",")
+        assert {"/static/replay-guard.js", "/static/replay-links.js"} <= set(scripts)
+        for script in scripts:
+            r = client.get(script)
+            assert r.status_code == 200, script
+            assert "javascript" in r.headers["content-type"], script
+
+    def test_the_link_notice_the_app_fills_is_on_the_page(self, client):
+        page = client.get("/").text
+        for element in ('id="replay-notice"', 'id="notice-url"', 'id="notice-open"', 'id="notice-close"'):
+            assert element in page, element
 
 
 class TestDateFilter:

@@ -44,6 +44,11 @@
         <a id="download">download .wacz</a>
       </div>
     </header>
+    <div id="replay-notice" class="notice" role="status" hidden>
+      <span class="notice-text">Not in the archive: <span id="notice-url"></span></span>
+      <a id="notice-open" target="_blank" rel="noopener noreferrer">open the original ↗</a>
+      <button id="notice-close" type="button" aria-label="Dismiss">×</button>
+    </div>
     <p id="replay-status" class="status" aria-live="polite"></p>
     <div id="player" class="player"></div>
   </section>
