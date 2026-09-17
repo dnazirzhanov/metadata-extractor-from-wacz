@@ -57,6 +57,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import date, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -72,7 +73,7 @@ import search as S                                              # noqa: E402
 import psycopg2.extras                                          # noqa: E402
 from psycopg2.pool import ThreadedConnectionPool                # noqa: E402
 
-from causalia_extractor.identity import PAGES_ROOT, WACZ_NAME  # noqa: E402
+from causalia_extractor.identity import PAGES_ROOT, WACZ_NAME, archive_id_for  # noqa: E402
 
 DSN_ENV = "CX_API_DSN"
 _pool: ThreadedConnectionPool | None = None
@@ -469,6 +470,59 @@ def wacz(article_id: int):
     with cursor() as cur:  # released before streaming: the player fetches many ranges at once
         _, path = _capture(cur, article_id)
     return FileResponse(path, media_type="application/wacz")
+
+
+class Resolved(BaseModel):
+    url: str = Field(description="the URL that was asked about")
+    article: ArticleRef = Field(description="the archived article it points to; its capture is on this machine")
+
+
+def _same_page_forms(url: str) -> list[str]:
+    """The URL first, then the forms a site serves as the same page: https for http, and no www.
+
+    archive_id_for() already ignores what else can differ in a link - tracking parameters,
+    parameter order, the fragment, a trailing slash - so these are the only variants to try.
+    """
+    parts = urlsplit(url)
+    host = parts.netloc.lower()
+    forms = [url]
+    for scheme in ("https", parts.scheme.lower()):
+        for netloc in (host.removeprefix("www."), host):
+            form = urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+            if form not in forms:
+                forms.append(form)
+    return forms
+
+
+@app.get("/resolve", response_model=Resolved, tags=["archive"])
+def resolve(
+    url: str = Query(max_length=4096,
+                     description="an absolute http(s) URL, e.g. a link inside an archived page"),
+    cur=Depends(_cur),
+):
+    """Which archived article a URL points to, so a link inside a replay can open our copy.
+
+    Matching is by the archive's own identity, the url_hash every capture is stored under -
+    never by title or by canonical_url, because a near miss would open a different article.
+    404 when we do not hold that page, or hold the row but not its capture.
+    """
+    parts = urlsplit(url.strip())
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        raise HTTPException(400, "give an absolute http(s) URL")
+    hashes = [archive_id_for(form) for form in _same_page_forms(url.strip())]
+    cur.execute("""
+        SELECT id FROM corpus.article
+         WHERE url_hash = ANY(%(hashes)s)
+         ORDER BY array_position(%(hashes)s::text[], url_hash)
+         LIMIT 1""", {"hashes": hashes})
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, "that page is not in the archive")
+    try:
+        article_row, _ = _capture(cur, row["id"])
+    except HTTPException:
+        raise HTTPException(404, "that page is in the corpus, but its capture is not on this machine") from None
+    return Resolved(url=url, article=_article_ref(article_row))
 
 
 @app.get("/articles/{article_id}/blocks", response_model=list[Passage],

@@ -9,12 +9,13 @@ const REASONS = {
   document: "terms spread across the article",
 };
 
-// The replay service worker, told to inject static/replay-guard.js into every archived page (that
-// file says why). The player appends "?serveIndex=1" to this name itself - the embed and its frame
-// both do - so the trailing "&_=" swallows that second "?": both register this same worker URL, and
-// serveIndex still reaches the worker. Injected paths must come in on the worker URL; the worker
-// refuses to fetch ones passed only through the embed's config.
-const REPLAY_WORKER = "sw.js?serveIndex=1&injectScripts=/static/replay-guard.js&_=";
+// The replay service worker, told to inject static/replay-guard.js and static/replay-links.js into
+// every archived page (each file says why; the worker splits the list on commas). The player appends
+// "?serveIndex=1" to this name itself - the embed and its frame both do - so the trailing "&_="
+// swallows that second "?": both register this same worker URL, and serveIndex still reaches the
+// worker. Injected paths must come in on the worker URL; the worker refuses to fetch ones passed only
+// through the embed's config.
+const REPLAY_WORKER = "sw.js?serveIndex=1&injectScripts=/static/replay-guard.js,/static/replay-links.js&_=";
 
 const $ = (id) => document.getElementById(id);
 const cache = new Map();   // "q|phrase|from|to|page" -> results, so Back is instant
@@ -22,6 +23,7 @@ let inflight = null;       // AbortController of the running request
 let tick = null;           // elapsed-time interval
 let cameFromResults = false;
 let replayUI = null;       // promise for /replay/ui.js, loaded on first replay
+let following = 0;         // the latest link click being resolved; older answers are dropped
 
 // Publication dates as the date inputs and the API write them; anything else is ignored.
 const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : null);
@@ -242,6 +244,7 @@ async function showReplay(s) {
   $("replay-view").hidden = false;
   $("back").href = urlFor({ ...s, article: null });
   $("player").replaceChildren();
+  $("replay-notice").hidden = true;
   $("replay-title").textContent = "";
   $("replay-sub").textContent = "";
   $("original").removeAttribute("href");
@@ -288,6 +291,46 @@ async function showReplay(s) {
   }
 }
 
+// A link clicked inside the archived page, handed up by static/replay-links.js: open our capture of
+// the page it points to, or say that we do not hold it.
+async function follow(url) {
+  const s = readState();
+  if (!s.article) return;
+  const mine = ++following;
+  $("replay-notice").hidden = true;
+  setStatus($("replay-status"), "Looking for that page in the archive…");
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`/resolve?${new URLSearchParams({ url })}`);
+    if (mine !== following || readState().article !== s.article) return;
+    console.info(`Causalia replay: /resolve ${r.status} in ${Math.round(performance.now() - t0)} ms`, url);
+    if (r.ok) {
+      const { article } = await r.json();
+      if (String(article.id) === s.article) {
+        setStatus($("replay-status"), "That link points to this same article.");
+        return;
+      }
+      // "← Results" goes to the results from here on; history.back() would only reach the previous article.
+      cameFromResults = false;
+      navigate({ ...s, article: article.id });
+      return;
+    }
+    if (r.status !== 404 && r.status !== 400) throw new Error(`HTTP ${r.status}`);
+    setStatus($("replay-status"), "");
+    $("notice-url").textContent = url;
+    $("notice-open").href = url;
+    $("replay-notice").hidden = false;
+  } catch (err) {
+    if (mine !== following) return;
+    setStatus($("replay-status"), `Could not look that link up: ${err.message}`, true);
+  }
+}
+
+window.addEventListener("message", (e) => {
+  if (e.origin !== location.origin || e.data?.type !== "causalia:follow" || typeof e.data.url !== "string") return;
+  follow(e.data.url);
+});
+
 function render() {
   const s = readState();
   $("q").value = s.q;
@@ -321,6 +364,9 @@ document.addEventListener("DOMContentLoaded", () => {
     e.preventDefault();
     if (cameFromResults) history.back();
     else navigate({ ...readState(), article: null });
+  });
+  $("notice-close").addEventListener("click", () => {
+    $("replay-notice").hidden = true;
   });
   render();
 });

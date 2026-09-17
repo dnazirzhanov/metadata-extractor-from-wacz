@@ -122,6 +122,18 @@ mark { padding: 0 2px; color: inherit; background: var(--mark); border-radius: 3
 #replay-sub { margin: 0; font-size: 13px; color: var(--muted); }
 .replay-links { display: flex; gap: 14px; font-size: 14px; white-space: nowrap; }
 #replay-status { min-height: 0; margin: 0; padding: 4px 20px; font-size: 12px; }
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 12px 6px 20px;
+  font-size: 14px;
+  background: var(--mark);
+  border-bottom: 1px solid var(--line);
+}
+.notice-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notice a { white-space: nowrap; }
+#notice-close { padding: 0 8px; font-size: 18px; line-height: 1.4; background: transparent; border: 0; }
 .player { flex: 1; min-height: 0; }
 replay-web-page { display: block; width: 100%; height: 100%; }
 
