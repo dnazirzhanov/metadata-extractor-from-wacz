@@ -309,6 +309,123 @@ PHRASE_HIT = ("""(
                                              %(query)s)))"""
               .replace("{PHRASE_FN}", PHRASE))
 
+#: PHRASE_HIT for a phrase search WITHOUT filters, with its paragraph test run
+#: ONCE per search instead of once per candidate.
+#:
+#: PHRASE_HIT's paragraph EXISTS is correlated: for every candidate it reads the
+#: article's current paragraphs, tests each against every word, and tokenizes
+#: the ones holding every word until one holds the phrase. On 'magyar kormány'
+#: (75,687 candidates, 15,299 results) that is most of the 22.7 s. Here the same
+#: paragraphs - text_tsv @@ search_query, then the phrase test - are found once,
+#: through the GIN index, as the set of (article, reading) pairs holding the
+#: phrase, and each candidate is looked up in that set.
+#:
+#: The same rows and the same test, so the same answer: a candidate's
+#: (a.id, a.current_extraction_id) is in the set exactly when the correlated
+#: EXISTS finds a row. Neither set column can be NULL, so IN never answers NULL
+#: for a candidate, and every candidate has a current reading (the gate).
+#:
+#: How PostgreSQL executes it is the point, so it is written for the planner:
+#:   - corpus.search_query(%(query)s), not q.tsq. The query literal makes the
+#:     tsquery a constant at plan time, the subquery is uncorrelated, and it runs
+#:     once as a hashed SubPlan over a (parallel) bitmap scan. q.tsq is a column
+#:     of the q CTE and would make it correlated - once per candidate again.
+#:   - The paragraph arm comes FIRST. Once the set exists a candidate costs one
+#:     hash probe, and the title, tag and author tokenizing only runs for the
+#:     candidates no paragraph matched. The order of the OR changes no answer:
+#:     every arm is an immutable test of the same row.
+#:   - The statement runs with SET_BASED_PHRASE_SETTINGS, so the set is built
+#:     with parallel workers even when the GIN estimate is far too low.
+#:   - tests/test_search_db.py requires "hashed SubPlan" in the plan, and the
+#:     settings on the set-based statement only.
+#:
+#: Only without filters. The set holds every phrase paragraph in the corpus,
+#: while a date, tag, author, section or outlet filter narrows the candidates
+#: PHRASE_HIT tests one by one: building the set measured up to ~3.5 s wall on
+#: 'magyar kormány' (2026-09-17), more than a narrow filtered search spends.
+#: phrase_check_is_set_based() picks the form, for search_articles() and
+#: matching_ids() alike.
+PHRASE_HIT_SET_BASED = ("""(
+               (a.id, a.current_extraction_id) IN (
+                   SELECT b.article_id, b.extraction_id
+                     FROM corpus.content_block b
+                    WHERE b.text_tsv @@ corpus.search_query(%(query)s)
+                      AND {PHRASE_FN}(b.block_text, %(query)s))
+               OR {PHRASE_FN}(concat_ws(' ', a.title, a.subtitle, a.description),
+                           %(query)s)
+               OR EXISTS (SELECT 1 FROM unnest(a.tags) AS tg
+                           WHERE {PHRASE_FN}(tg, %(query)s))
+               OR EXISTS (SELECT 1 FROM unnest(a.authors) AS au
+                           WHERE {PHRASE_FN}(au, %(query)s))
+               OR EXISTS (SELECT 1 FROM corpus.article_image i
+                           WHERE i.article_id = a.id
+                             AND i.extraction_id = a.current_extraction_id
+                             AND i.caption_tsv @@ q.tsq
+                             AND {PHRASE_FN}(concat_ws(' ', i.caption, i.alt),
+                                             %(query)s)))"""
+                        .replace("{PHRASE_FN}", PHRASE))
+
+
+def phrase_check_is_set_based(phrase: bool, *filters) -> bool:
+    """A phrase search with no filter at all uses PHRASE_HIT_SET_BASED.
+
+    A filter counts when it is not None - the SQL tests `IS NULL`, so an empty
+    string is a filter there too."""
+    return bool(phrase) and all(f is None for f in filters)
+
+
+#: Planner settings for the one statement that tests paragraphs as a set.
+#:
+#: The set is built by a bitmap scan the planner may run with parallel workers,
+#: and it decides from the GIN estimate of the paragraphs holding every word -
+#: which is often 1 row, far below the real count ('Orbán Viktor': 79,021). It
+#: then builds the set in one process: measured 2026-09-17, that made 'orban
+#: viktor' 15.1 s where the per-candidate check took 13.5 s. With these settings
+#: the build always gets workers, and nothing else in the plan moved (every plan
+#: identical outside the set build). Medians, main -> set-based -> set-based
+#: with these settings, identical results throughout:
+#:   kormány         34.7 -> 18.4 -> 15.1 s      Orbán Viktor  11.3 -> 11.7 -> 8.3 s
+#:   magyar kormány  21.1 -> 13.2 -> 12.1 s      orosz elnök    5.8 ->  3.8 -> 3.9 s
+#:   orban viktor    13.5 -> 15.1 ->  9.3 s
+#: Four workers, not two: 2 fixed the serial builds, 4 also cut the large ones
+#: (kormány 18.3 -> 15.1 s). max_parallel_workers (8) caps them all together, so
+#: concurrent phrase searches get fewer workers, not an error.
+SET_BASED_PHRASE_SETTINGS = (
+    ("parallel_setup_cost", "0"),
+    ("parallel_tuple_cost", "0"),
+    ("min_parallel_table_scan_size", "0"),
+    ("max_parallel_workers_per_gather", "4"),
+)
+
+
+def _apply_local_settings(cur, settings) -> list | None:
+    """Set `settings` for the rest of the current transaction and return what
+    they were, for _restore_local_settings(). Nothing is sent when `settings` is
+    empty.
+
+    Transaction-local (set_config(..., true), like SET LOCAL): on a connection in
+    autocommit mode they end with this very statement and do not reach the next
+    one - the search is then planned with the server's defaults, and returns the
+    same rows. If the statement between apply and restore fails, the transaction
+    is aborted, and rolling it back discards the settings with it."""
+    if not settings:
+        return None
+    names = [name for name, _ in settings]
+    cur.execute("SELECT " + ", ".join("current_setting(%s)" for _ in names), names)
+    previous = list(cur.fetchone())
+    cur.execute("SELECT " + ", ".join("set_config(%s, %s, true)" for _ in names),
+                [part for pair in settings for part in pair])
+    return list(zip(names, previous))
+
+
+def _restore_local_settings(cur, previous) -> None:
+    """Put back what _apply_local_settings() replaced, so the passage queries and
+    anything else the caller runs in the same transaction keep their own plans."""
+    if previous:
+        cur.execute("SELECT " + ", ".join("set_config(%s, %s, true)" for _ in previous),
+                    [part for pair in previous for part in pair])
+
+
 #: The match predicate itself, shared by search_articles() and matching_ids().
 #: Two copies of a WHERE clause is how a ranked result list and the recall set
 #: measured against it quietly stop meaning the same thing - the same argument
@@ -316,8 +433,10 @@ PHRASE_HIT = ("""(
 #: MATCH_FILTERS is everything but candidate membership: search_articles() gets
 #: membership by joining `doc` (ONE_TERM_CANDIDATES' or CANDIDATES'), and
 #: matching_ids() by MATCH_WHERE's IN - the same filters either way, written once.
+#: The _SET_BASED pair differs only in the phrase test (PHRASE_HIT_SET_BASED).
 #: Expects the CTEs in CANDIDATES, and the same parameter names.
-MATCH_FILTERS = ("""(NOT %(phrase)s OR """ + PHRASE_HIT + """)
+def _match_filters(phrase_hit: str) -> str:
+    return ("""(NOT %(phrase)s OR """ + phrase_hit + """)
           AND (%(outlet)s  IS NULL OR a.outlet = %(outlet)s)
           AND (%(tag)s     IS NULL OR a.tags @> ARRAY[%(tag)s]::text[])
           AND (%(author)s  IS NULL OR a.authors @> ARRAY[%(author)s]::text[])
@@ -327,8 +446,14 @@ MATCH_FILTERS = ("""(NOT %(phrase)s OR """ + PHRASE_HIT + """)
           AND (%(date_to)s IS NULL
                OR a.published_at < (%(date_to)s::date + 1)::timestamptz)
 """)
+
+
+MATCH_FILTERS = _match_filters(PHRASE_HIT)
 MATCH_WHERE = ("""a.id IN (SELECT article_id FROM doc)
           AND """ + MATCH_FILTERS)
+MATCH_FILTERS_SET_BASED = _match_filters(PHRASE_HIT_SET_BASED)
+MATCH_WHERE_SET_BASED = ("""a.id IN (SELECT article_id FROM doc)
+          AND """ + MATCH_FILTERS_SET_BASED)
 
 #: A headline is for a human reading a result list; the block's full text is
 #: returned beside it so an agent never has to parse the markers.
@@ -616,7 +741,12 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
     # a random page (Orban Viktor's ranking reads 2.0 -> 2.6 s, 2026-09-17). The
     # join keeps the candidates in article order.
     source = "doc d\n        JOIN corpus.article a ON a.id = d.article_id"
-    where = MATCH_FILTERS
+    # A phrase search without filters tests paragraphs as one set per search
+    # (PHRASE_HIT_SET_BASED), with SET_BASED_PHRASE_SETTINGS around the ranked
+    # statement only; a filtered one keeps the per-candidate test.
+    set_based = phrase_check_is_set_based(phrase, outlet, tag, author, section,
+                                          date_from, date_to)
+    where = MATCH_FILTERS_SET_BASED if set_based else MATCH_FILTERS
     cur.execute("SELECT cardinality(corpus.search_terms(%(query)s))",
                 {"query": query})
     if cur.fetchone()[0] == 1:
@@ -679,6 +809,7 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
                   -- from the same single read of the candidate's rows (tr).
                   + coalesce(tr.q_body, 0)
                   + coalesce(tr.q_caption, 0)"""
+    previous = _apply_local_settings(cur, SET_BASED_PHRASE_SETTINGS if set_based else ())
     cur.execute(f"""
         WITH {candidates},
         -- The accented query of each term, computed ONCE per search. It depends
@@ -818,9 +949,11 @@ def search_articles(cur, query: str, *, limit: int = 10, offset: int = 0,
           "offset": offset,
           "author": author, "section": section, "phrase": phrase,
           "date_from": date_from, "date_to": date_to})
+    rows = cur.fetchall()
+    _restore_local_settings(cur, previous)
 
     results = []
-    for row in cur.fetchall():
+    for row in rows:
         hit = dict(row)
         hit["total_matches"] = int(hit["total_matches"])
         hit["body_rank"] = float(hit["body_rank"] or 0.0)
@@ -870,17 +1003,23 @@ def matching_ids(cur, query: str, *, outlet: str | None = None,
 
     Use this for "did it find them"; use search_articles for "what to show".
     """
+    set_based = phrase_check_is_set_based(phrase, outlet, tag, author, section,
+                                          date_from, date_to)
+    where = MATCH_WHERE_SET_BASED if set_based else MATCH_WHERE
+    previous = _apply_local_settings(cur, SET_BASED_PHRASE_SETTINGS if set_based else ())
     cur.execute(f"""
         WITH {CANDIDATES}
         SELECT a.id
         FROM corpus.article a
         JOIN corpus.searchable_article sa ON sa.id = a.id
         CROSS JOIN q
-        WHERE {MATCH_WHERE}
+        WHERE {where}
     """, {"query": query, "outlet": outlet, "tag": tag, "author": author,
           "section": section, "phrase": phrase,
           "date_from": date_from, "date_to": date_to})
-    return {row[0] for row in cur.fetchall()}
+    ids = {row[0] for row in cur.fetchall()}
+    _restore_local_settings(cur, previous)
+    return ids
 
 
 def search_article_content(cur, query: str, *, limit: int = 20,
